@@ -28,4 +28,4 @@ jobs:
     # 4. הרצת קוד המעבדה (ללא צורך בטלגרם או שמירת נתונים)
     - name: Run Test Bot
       run: |
-        python test_bot.py
+        python bot.py
