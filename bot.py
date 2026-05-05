@@ -15,7 +15,7 @@ warnings.filterwarnings("ignore")
 # ========================================== 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP") 
-CUSTOM_TICKERS_FILE = "mystock.csv" 
+CUSTOM_TICKERS_FILE = "my_stocks.csv" 
 MIN_MARKET_CAP = 2_000_000_000 
 MIN_DOLLAR_VOL_50 = 20_000_000 
 MIN_PRICE = 12.0 
@@ -29,8 +29,6 @@ def load_brain():
         "max_cup_depth": 0.45, 
         "min_breakout_close_strength": 0.25, 
         "min_rs_65": 0.02, 
-        # max_dist_from_52w_high מוגדר כעת בנפרד לכל מצב: 
-        # מניות מעל 150 -> 0.25, מניות מתחת ל-150 -> 0.45 
         "max_dist_from_52w_high_normal": 0.25, 
         "max_dist_from_52w_high_below_150": 0.45, 
         "max_gap_above_pivot": 0.03, 
@@ -132,22 +130,15 @@ def load_tickers():
     return ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'META', 'GOOGL', 'PLTR'] 
 
 # ========================================== 
-# 3. פונקציות עזר חדשות 
+# 3. פונקציות עזר 
 # ========================================== 
-# [תיקון 1] בדיקת Market Cap אמיתית דרך yfinance 
 def check_market_cap(ticker): 
-    """ 
-    מחזיר את ה-market cap של המניה. משתמש ב-fast_info קודם (מהיר), ואם נכשל, עובר ל-info (אטי). 
-    מחזיר None אם לא ניתן למשוך. 
-    """ 
     try: 
         t = yf.Ticker(ticker) 
-        # fast_info מהיר יותר, אך לא תמיד קיים 
         fast = getattr(t, 'fast_info', None) 
         if fast is not None: 
             mc = getattr(fast, 'market_cap', None) 
             if mc and mc > 0: return float(mc) 
-        # fallback ל-info 
         info = t.info 
         mc = info.get('marketCap') or info.get('market_cap') 
         if mc and mc > 0: return float(mc) 
@@ -155,12 +146,7 @@ def check_market_cap(ticker):
         pass 
     return None 
 
-# [תיקון 2] מוצא swing highs מקומיים במקום argmax גלובלי 
 def find_swing_highs(arr, window=5): 
-    """ 
-    מחזיר רשימה של (index, value) של שיאים מקומיים. 
-    שיא מקומי = הנקודה הגבוהה ביותר בחלון של window ימים לכל צד. 
-    """ 
     peaks = [] 
     for i in range(window, len(arr) - window): 
         local_max = max(arr[i - window : i + window + 1]) 
@@ -168,11 +154,7 @@ def find_swing_highs(arr, window=5):
             peaks.append((i, float(arr[i]))) 
     return peaks 
 
-# [תיקון 3] מוצא swing lows מקומיים 
 def find_swing_lows(arr, window=5): 
-    """ 
-    מחזיר רשימה של (index, value) של שפלים מקומיים. 
-    """ 
     troughs = [] 
     for i in range(window, len(arr) - window): 
         local_min = min(arr[i - window : i + window + 1]) 
@@ -181,7 +163,7 @@ def find_swing_lows(arr, window=5):
     return troughs 
 
 # ========================================== 
-# 4. מנוע טכני ותבניות 
+# 4. מנוע טכני 
 # ========================================== 
 def add_indicators(df): 
     df = df.copy() 
@@ -230,44 +212,35 @@ def market_filter_ok(spy_df):
     return ( (today["Close"] > today["SMA_50"] > today["SMA_150"] > today["SMA_200"]) and (today["SMA_200"] > sma200_old) ) 
 
 # ========================================== 
-# פונקציות תבנית — משתמשות ב-Swing Highs/Lows 
+# תבניות (עם סינון VCP נוקשה נגד תעלות עולות)
 # ========================================== 
 def get_ascending_triangle_signal(hist): 
-    """ 
-    [תיקון מרכזי] הוחלפו argmax/argmin גלובליים ב-swing highs/lows מקומיים. 
-    מחפש VCP קלאסי: שיא -> עמק -> שיא שני קרוב -> עמק גבוה יותר -> כיווץ. 
-    """ 
     recent = hist.tail(150) 
     if len(recent) < 60: return None 
     highs = recent["High"].values 
     lows = recent["Low"].values 
     
-    # --- שלב 1: מצא שיאים מקומיים בכל הגרף (פרט ל-21 ימים אחרונים לפיבוט) 
     swing_highs = find_swing_highs(highs[:-21], window=5) 
     if len(swing_highs) < 2: return None 
-    # בחר את השיא הראשון: הגבוה ביותר בקבוצת הswing highs 
     peak1_pos, peak1_price = max(swing_highs, key=lambda x: x[1]) 
     
-    # --- שלב 2: עמק ראשון אחרי השיא הראשון 
     post_peak1_lows = find_swing_lows(lows[peak1_pos + 1 : -5], window=3) 
     if not post_peak1_lows: return None 
     valley1_pos_rel, valley1_price = min(post_peak1_lows, key=lambda x: x[1]) 
     valley1_abs_pos = valley1_pos_rel + peak1_pos + 1 
-    if (peak1_price - valley1_price) / peak1_price > BRAIN['max_base_depth']: return None 
     
-    # --- שלב 3: שיא שני אחרי העמק הראשון 
+    base_depth = (peak1_price - valley1_price) / max(peak1_price, 1e-9)
+    if base_depth < 0.08 or base_depth > BRAIN['max_base_depth']: return None 
+    
     post_valley1_highs = find_swing_highs(highs[valley1_abs_pos + 1 : -2], window=4) 
     if not post_valley1_highs: return None 
-    # בוחר את השיא הגבוה ביותר (הרלוונטי ביותר לפיבוט) 
     peak2_pos_rel, peak2_price = max(post_valley1_highs, key=lambda x: x[1]) 
-    # השיא השני צריך להיות קרוב לראשון (90%–105%) 
-    if not (peak1_price * 0.90 <= peak2_price <= peak1_price * 1.05): return None 
+    
+    if peak2_price < peak1_price * 0.85 or peak2_price > peak1_price * 1.02: return None 
     peak2_abs_pos = peak2_pos_rel + valley1_abs_pos + 1 
     
-    # --- שלב 4: עמק שני אחרי השיא השני — חייב להיות גבוה מהעמק הראשון 
     post_peak2_lows = find_swing_lows(lows[peak2_abs_pos + 1 :], window=3) 
     if not post_peak2_lows: 
-        # אם אין swing low מוגדר, קח את המינימום raw 
         raw = lows[peak2_abs_pos + 1 :] 
         if len(raw) < 3: return None 
         valley2_price = float(np.min(raw)) 
@@ -275,8 +248,12 @@ def get_ascending_triangle_signal(hist):
         _, valley2_price = min(post_peak2_lows, key=lambda x: x[1]) 
         
     if valley2_price <= valley1_price * 1.015: return None 
-    tightness = (peak2_price - valley2_price) / peak2_price 
+    
+    tightness = (peak2_price - valley2_price) / max(peak2_price, 1e-9)
     if tightness > BRAIN['max_tightness_depth']: return None 
+    
+    if tightness >= base_depth * 0.75: return None
+
     return { 
         "pivot_price": max(peak1_price, peak2_price), 
         "tight_low": valley2_price, 
@@ -285,35 +262,31 @@ def get_ascending_triangle_signal(hist):
     } 
 
 def get_cup_handle_signal(hist): 
-    """ 
-    [תיקון מרכזי] הוחלף argmax גלובלי ב-swing highs. 
-    מחפש rim מהשיאים המקומיים, ולא מהמקסימום הגלובלי. 
-    """ 
     recent = hist.tail(250) 
     if len(recent) < 60: return None 
     highs = recent["High"].values 
     lows = recent["Low"].values 
     
-    # --- שלב 1: מצא rim מ-swing highs (פרט ל-21 ימים אחרונים) 
     swing_highs = find_swing_highs(highs[:-21], window=5) 
     if not swing_highs: return None 
-    # Rim = השיא הגבוה ביותר מבין השיאים המקומיים 
     rim_idx, rim_price = max(swing_highs, key=lambda x: x[1]) 
     
-    # --- שלב 2: תחתית הכוס אחרי ה-rim 
     cup_section = lows[rim_idx:] 
     if len(cup_section) < 21: return None 
     cup_low = float(np.min(cup_section)) 
-    depth = (rim_price - cup_low) / rim_price 
-    if not (BRAIN['min_cup_depth'] <= depth <= BRAIN['max_cup_depth']): return None 
     
-    # --- שלב 3: ידית בצד ימין — בחלון של 21 ימים אחרונים 
+    depth = (rim_price - cup_low) / max(rim_price, 1e-9)
+    if not (0.10 <= depth <= BRAIN['max_cup_depth']): return None 
+    
     cup_to_now = recent.iloc[rim_idx:] 
     if len(cup_to_now) < 21: return None 
     handle_low = float(cup_to_now["Low"].min()) 
-    # הידית לא יכולה לרדת מתחת ל-35% מעומק הכוס 
+    
     if handle_low < (cup_low + 0.35 * (rim_price - cup_low)): return None 
-    tightness = (rim_price - handle_low) / rim_price 
+    
+    tightness = (rim_price - handle_low) / max(rim_price, 1e-9)
+    if tightness >= depth * 0.75: return None
+
     return { 
         "pivot_price": rim_price, 
         "tight_low": handle_low, 
@@ -322,16 +295,11 @@ def get_cup_handle_signal(hist):
     } 
 
 def get_multi_touch_vcp_signal(hist): 
-    """ 
-    Flat Base: מחפש לפחות 3 נגיעות באותה רמת התנגדות (סטייה עד 4%). 
-    הפונקציה הזו כבר השתמשה בגישת swing highs — נשארה כמעט ללא שינוי עם שיפור קל ב-window וב-tightness. 
-    """ 
     recent = hist.tail(250) 
     if len(recent) < 60: return None 
     highs = recent["High"].values 
     lows = recent["Low"].values 
     
-    # חיפוש swing highs בחלון של 10 ימים (כמקור — נשאר) 
     peaks = [] 
     for i in range(10, len(highs) - 10): 
         if highs[i] == max(highs[i - 10 : i + 11]): 
@@ -342,7 +310,7 @@ def get_multi_touch_vcp_signal(hist):
     best_group = [] 
     best_pivot = 0.0 
     for p_idx, p_val in peaks: 
-        group = [ idx for idx, val in peaks if abs(val - p_val) / max(p_val, 1e-9) <= 0.04 ] 
+        group = [ idx for idx, val in peaks if abs(val - p_val) / max(p_val, 1e-9) <= 0.025 ] 
         if len(group) > len(best_group) or ( len(group) == len(best_group) and p_val > best_pivot ): 
             best_group = group 
             best_pivot = float(np.max([highs[i] for i in group])) 
@@ -353,13 +321,15 @@ def get_multi_touch_vcp_signal(hist):
     first_touch_idx = best_group[0] 
     base_low = float(np.min(lows[first_touch_idx:])) 
     depth = (best_pivot - base_low) / max(best_pivot, 1e-9) 
-    if depth > BRAIN['max_base_depth'] or depth < 0.05: return None 
     
-    # כיווץ ימני: מתמקד ב-15 ימים האחרונים 
+    if depth > BRAIN['max_base_depth'] or depth < 0.10: return None 
+    
     recent_low = float(np.min(lows[-15:])) 
     tightness = (best_pivot - recent_low) / max(best_pivot, 1e-9) 
     if tightness > BRAIN['max_tightness_depth']: return None 
     
+    if tightness >= depth * 0.60: return None
+
     return { 
         "pivot_price": best_pivot, 
         "tight_low": recent_low, 
@@ -385,7 +355,6 @@ def scan_market():
             market_warning = ( "⚠️ <b>שים לב: השוק הכללי חלש (SPY מתחת לממוצעים).</b> " "הסריקה ממשיכה לבקשתך, אך הסיכון לפריצות שווא גבוה.\n\n" ) 
             
     all_potentials = [] 
-    # מטמון market caps כדי לא להריץ API call כפול 
     market_cap_cache = {} 
     
     for ticker in tickers: 
@@ -400,12 +369,10 @@ def scan_market():
             yesterday = df.iloc[-2] 
             past_data = df.iloc[:-1] 
             
-            # --- פילטרים בסיסיים --- 
             if any(pd.isna(today[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ATR_14"]): continue 
             if float(today["Close"]) < MIN_PRICE: continue 
             if float(today["DollarVol_50"]) < MIN_DOLLAR_VOL_50: continue 
             
-            # [תיקון: בדיקת Market Cap אמיתית] 
             if ticker not in market_cap_cache: 
                 mc = check_market_cap(ticker) 
                 market_cap_cache[ticker] = mc 
@@ -415,24 +382,20 @@ def scan_market():
                 print(f" ↳ {ticker} נפסל: market cap ${mc/1e9:.1f}B < מינימום") 
                 continue 
                 
-            # --- תנאי מגמה --- 
             if not (float(today["Close"]) > float(today["SMA_50"])): continue 
             is_below_150 = float(today["Close"]) < float(today["SMA_150"]) 
             if is_below_150 and float(today["SMA_50"]) <= float(yesterday["SMA_50"]): continue 
             
-            # [תיקון: מרחק מ-52w high גמיש לפי מצב המניה] 
             high_252 = float(today["High_252"]) if not pd.isna(today["High_252"]) else None 
             if high_252 is not None and high_252 > 0: 
                 dist_52w = (float(today["Close"]) / high_252) - 1.0 
                 max_dist = ( BRAIN['max_dist_from_52w_high_below_150'] if is_below_150 else BRAIN['max_dist_from_52w_high_normal'] ) 
                 if dist_52w < -max_dist: continue 
                 
-            # --- עוצמה יחסית --- 
             required_rs = BRAIN['min_rs_65'] * 2 if is_below_150 else BRAIN['min_rs_65'] 
             stock_rs = float(today["ROC_65"]) - spy_rs 
             if stock_rs < required_rs: continue 
             
-            # --- זיהוי תבנית (Swing Highs) --- 
             pattern = ( get_ascending_triangle_signal(past_data) or get_cup_handle_signal(past_data) or get_multi_touch_vcp_signal(past_data) ) 
             if not pattern: continue 
             if is_below_150 and pattern["tightness"] > 0.05: continue 
@@ -460,7 +423,6 @@ def scan_market():
                     atr = float(today["ATR_14"]) 
                     stop_price = float(pattern["tight_low"]) - (0.2 * atr) 
                     risk_pct = (float(today["Close"]) - stop_price) / float(today["Close"]) * 100 
-                    # מוסיף מידע על market cap להודעה 
                     mc_str = f"${mc/1e9:.1f}B" if mc else "N/A" 
                     alert_data = { 
                         "ticker": ticker, "close": float(today["Close"]), "pivot": pivot, 
@@ -476,7 +438,7 @@ def scan_market():
         time.sleep(0.15) 
 
 # ========================================== 
-# 6. שיגור האיתותים לטלגרם ורישום בזיכרון 
+# 6. שיגור האיתותים לטלגרם 
 # ========================================== 
     print("\n" + "=" * 50) 
     all_potentials_sorted = sorted(all_potentials, key=lambda x: abs(x["dist_to_pivot"])) 
@@ -527,7 +489,6 @@ def scan_market():
             msg += f"👀 <b>מתבשלות למעקב ({len(final_wl)}):</b>\n\n" 
             for a in final_wl: 
                 base_line = format_stock_block(a, "⏳") 
-                # מוסיף שורת מרחק לפיבוט רק לwatchlist 
                 base_line = base_line.replace( f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f}", f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f} (מרחק: {a['dist_to_pivot']:.1f}%)" ) 
                 msg += base_line 
                 log_signal(a['ticker'], a['close']) 
