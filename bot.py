@@ -16,21 +16,21 @@ warnings.filterwarnings("ignore")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP") 
 CUSTOM_TICKERS_FILE = "mystock.csv" 
-MIN_MARKET_CAP = 2_000_000_000  # 1 מיליארד דולר מינימום לחברות בשיקום
+MIN_MARKET_CAP = 2_000_000_000  
 MIN_DOLLAR_VOL_50 = 20_000_000  
 MIN_PRICE = 10.0 
 COOLDOWN_DAYS = 5 
 
 def load_brain(): 
     brain = { 
-        "max_base_depth": 0.85,         # פתוח להתרסקויות של עד 85% כדי לתפוס בסיסים ארוכים 
-        "max_tightness_depth": 0.12, 
+        "max_base_depth": 0.85,         
+        "max_tightness_depth": 0.12, # זה עכשיו ישמש רק כמינימום דינמי למניות רגילות
         "min_cup_depth": 0.10, 
-        "max_cup_depth": 0.85,          # הוגדל בהתאמה
+        "max_cup_depth": 0.85,          
         "min_breakout_close_strength": 0.25, 
         "min_rs_65": 0.02, 
         "max_dist_from_52w_high_normal": 0.25, 
-        "max_dist_from_52w_high_below_150": 0.85, # מניות בשיקום יכולות להיות רחוקות עד 85% מהשיא השנתי
+        "max_dist_from_52w_high_below_150": 0.85, 
         "max_gap_above_pivot": 0.03, 
         "max_entry_extension": 0.04, 
         "breakout_volume_ratio": 1.1 
@@ -130,7 +130,7 @@ def load_tickers():
     return ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'META', 'GOOGL', 'PLTR'] 
 
 # ========================================== 
-# 3. פונקציות עזר מורחבות 
+# 3. פונקציות עזר 
 # ========================================== 
 def check_market_cap(ticker): 
     try: 
@@ -212,7 +212,7 @@ def market_filter_ok(spy_df):
     return ( (today["Close"] > today["SMA_50"] > today["SMA_150"] > today["SMA_200"]) and (today["SMA_200"] > sma200_old) ) 
 
 # ========================================== 
-# תבניות (מסוננות מפני תעלות עולות ומלכודות V)
+# תבניות - כיווץ דינמי שמתאים למניות בשיקום
 # ========================================== 
 def get_ascending_triangle_signal(hist): 
     recent = hist.tail(150) 
@@ -236,7 +236,7 @@ def get_ascending_triangle_signal(hist):
     if not post_valley1_highs: return None 
     peak2_pos_rel, peak2_price = max(post_valley1_highs, key=lambda x: x[1]) 
     
-    if peak2_price < peak1_price * 0.85 or peak2_price > peak1_price * 1.02: return None 
+    if peak2_price < peak1_price * 0.85 or peak2_price > peak1_price * 1.015: return None 
     peak2_abs_pos = peak2_pos_rel + valley1_abs_pos + 1 
     
     if len(lows) - peak2_abs_pos < 3: return None
@@ -252,9 +252,14 @@ def get_ascending_triangle_signal(hist):
     if valley2_price <= valley1_price * 1.015: return None 
     
     tightness = (peak2_price - valley2_price) / max(peak2_price, 1e-9)
-    if tightness > BRAIN['max_tightness_depth']: return None 
     
-    if tightness >= base_depth * 0.75: return None
+    # 🚨 תיקון דינמי אדיר: מקסימום הכיווץ מחושב באופן יחסי לעומק הבסיס.
+    # אם המניה ירדה 64%, מותר לה להתכווץ ב-32%.
+    dynamic_max_tightness = max(BRAIN['max_tightness_depth'], base_depth * 0.50)
+    
+    # אבל אנחנו שמים גג אבסולוטי (28%) כדי לא לקנות רכבות הרים.
+    if tightness > dynamic_max_tightness or tightness > 0.28: return None 
+    if tightness >= base_depth * 0.70: return None # עדיין דורש שהידית תהיה קטנה משמעותית מהבסיס
 
     return { 
         "pivot_price": max(peak1_price, peak2_price), 
@@ -287,18 +292,21 @@ def get_cup_handle_signal(hist):
     right_rim_rel_idx, right_rim_price = max(recovery_highs, key=lambda x: x[1])
     right_rim_abs_idx = cup_low_abs_idx + right_rim_rel_idx
 
-    if right_rim_price < left_rim_price * 0.85 or right_rim_price > left_rim_price * 1.05: return None
+    if right_rim_price < left_rim_price * 0.85 or right_rim_price > left_rim_price * 1.015: return None
 
     handle_section = lows[right_rim_abs_idx:]
-    
     if len(handle_section) < 3: return None 
     
     handle_low = float(np.min(handle_section)) 
-    if handle_low < (cup_low_price + 0.35 * (left_rim_price - cup_low_price)): return None 
     
+    # כיווץ (ידית) נמדד מהשפה הימנית עד לנמוך של הידית (שפלים עולים)
     tightness = (right_rim_price - handle_low) / max(right_rim_price, 1e-9)
-    if tightness >= depth * 0.75: return None
-    if tightness > BRAIN['max_tightness_depth']: return None 
+    
+    # 🚨 חישוב דינמי לידיות בספלים עמוקים (HUN Style)
+    dynamic_max_tightness = max(BRAIN['max_tightness_depth'], depth * 0.50)
+    
+    if tightness > dynamic_max_tightness or tightness > 0.28: return None 
+    if tightness >= depth * 0.70: return None
 
     return { 
         "pivot_price": right_rim_price, 
@@ -323,13 +331,15 @@ def get_multi_touch_vcp_signal(hist):
     best_group = [] 
     best_pivot = 0.0 
     for p_idx, p_val in peaks: 
-        group = [ idx for idx, val in peaks if abs(val - p_val) / max(p_val, 1e-9) <= 0.04 ] 
+        group = [ idx for idx, val in peaks if abs(val - p_val) / max(p_val, 1e-9) <= 0.025 ] 
         if len(group) > len(best_group) or ( len(group) == len(best_group) and p_val > best_pivot ): 
             best_group = group 
             best_pivot = float(np.max([highs[i] for i in group])) 
             
     if len(best_group) < 3: return None 
     if best_group[-1] - best_group[0] < 30: return None 
+    
+    if best_pivot < np.max(highs[-150:]) * 0.95: return None
     
     first_touch_idx = best_group[0] 
     base_low = float(np.min(lows[first_touch_idx:])) 
@@ -342,9 +352,12 @@ def get_multi_touch_vcp_signal(hist):
 
     recent_low = float(np.min(lows[-15:])) 
     tightness = (best_pivot - recent_low) / max(best_pivot, 1e-9) 
-    if tightness > BRAIN['max_tightness_depth']: return None 
     
-    if tightness >= depth * 0.60: return None
+    # 🚨 התאמה דינמית לבסיסים שטוחים ועמוקים
+    dynamic_max_tightness = max(BRAIN['max_tightness_depth'], depth * 0.50)
+    
+    if tightness > dynamic_max_tightness or tightness > 0.28: return None 
+    if tightness >= depth * 0.70: return None
 
     return { 
         "pivot_price": best_pivot, 
@@ -395,7 +408,6 @@ def scan_market():
             else: 
                 mc = market_cap_cache[ticker] 
             if mc is not None and mc < MIN_MARKET_CAP: 
-                print(f" ↳ {ticker} נפסל: market cap ${mc/1e9:.1f}B < מינימום") 
                 continue 
                 
             if not (float(today["Close"]) > float(today["SMA_50"])): continue 
