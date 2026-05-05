@@ -16,8 +16,8 @@ warnings.filterwarnings("ignore")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP") 
 CUSTOM_TICKERS_FILE = "my_stocks.csv" 
-MIN_MARKET_CAP = 1_000_000_000  # 1 מיליארד דולר מינימום לחברות בשיקום
-MIN_DOLLAR_VOL_50 = 10_000_000  
+MIN_MARKET_CAP = 2_000_000_000  # 1 מיליארד דולר מינימום לחברות בשיקום
+MIN_DOLLAR_VOL_50 = 20_000_000  
 MIN_PRICE = 10.0 
 COOLDOWN_DAYS = 5 
 
