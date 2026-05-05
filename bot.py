@@ -15,22 +15,22 @@ warnings.filterwarnings("ignore")
 # ========================================== 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP") 
-CUSTOM_TICKERS_FILE = "mystock.csv" 
-MIN_MARKET_CAP = 2_000_000_000 
-MIN_DOLLAR_VOL_50 = 20_000_000 
-MIN_PRICE = 12.0 
+CUSTOM_TICKERS_FILE = "my_stocks.csv" 
+MIN_MARKET_CAP = 1_000_000_000  # 1 מיליארד דולר מינימום לחברות בשיקום
+MIN_DOLLAR_VOL_50 = 10_000_000  
+MIN_PRICE = 10.0 
 COOLDOWN_DAYS = 5 
 
 def load_brain(): 
     brain = { 
-        "max_base_depth": 0.45, 
+        "max_base_depth": 0.85,         # פתוח להתרסקויות של עד 85% כדי לתפוס בסיסים ארוכים 
         "max_tightness_depth": 0.12, 
         "min_cup_depth": 0.10, 
-        "max_cup_depth": 0.45, 
+        "max_cup_depth": 0.85,          # הוגדל בהתאמה
         "min_breakout_close_strength": 0.25, 
         "min_rs_65": 0.02, 
         "max_dist_from_52w_high_normal": 0.25, 
-        "max_dist_from_52w_high_below_150": 0.45, 
+        "max_dist_from_52w_high_below_150": 0.85, # מניות בשיקום יכולות להיות רחוקות עד 85% מהשיא השנתי
         "max_gap_above_pivot": 0.03, 
         "max_entry_extension": 0.04, 
         "breakout_volume_ratio": 1.1 
@@ -130,7 +130,7 @@ def load_tickers():
     return ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'AMZN', 'META', 'GOOGL', 'PLTR'] 
 
 # ========================================== 
-# 3. פונקציות עזר 
+# 3. פונקציות עזר מורחבות 
 # ========================================== 
 def check_market_cap(ticker): 
     try: 
@@ -212,7 +212,7 @@ def market_filter_ok(spy_df):
     return ( (today["Close"] > today["SMA_50"] > today["SMA_150"] > today["SMA_200"]) and (today["SMA_200"] > sma200_old) ) 
 
 # ========================================== 
-# תבניות (עם סינון VCP נוקשה נגד תעלות עולות)
+# תבניות (מסוננות מפני תעלות עולות ומלכודות V)
 # ========================================== 
 def get_ascending_triangle_signal(hist): 
     recent = hist.tail(150) 
@@ -239,7 +239,9 @@ def get_ascending_triangle_signal(hist):
     if peak2_price < peak1_price * 0.85 or peak2_price > peak1_price * 1.02: return None 
     peak2_abs_pos = peak2_pos_rel + valley1_abs_pos + 1 
     
-    post_peak2_lows = find_swing_lows(lows[peak2_abs_pos + 1 :], window=3) 
+    if len(lows) - peak2_abs_pos < 3: return None
+
+    post_peak2_lows = find_swing_lows(lows[peak2_abs_pos + 1 :], window=2) 
     if not post_peak2_lows: 
         raw = lows[peak2_abs_pos + 1 :] 
         if len(raw) < 3: return None 
@@ -269,26 +271,37 @@ def get_cup_handle_signal(hist):
     
     swing_highs = find_swing_highs(highs[:-21], window=5) 
     if not swing_highs: return None 
-    rim_idx, rim_price = max(swing_highs, key=lambda x: x[1]) 
+    left_rim_idx, left_rim_price = max(swing_highs, key=lambda x: x[1]) 
     
-    cup_section = lows[rim_idx:] 
+    cup_section = lows[left_rim_idx:] 
     if len(cup_section) < 21: return None 
-    cup_low = float(np.min(cup_section)) 
+    cup_low_rel_idx = int(np.argmin(cup_section))
+    cup_low_abs_idx = left_rim_idx + cup_low_rel_idx
+    cup_low_price = float(cup_section[cup_low_rel_idx]) 
     
-    depth = (rim_price - cup_low) / max(rim_price, 1e-9)
+    depth = (left_rim_price - cup_low_price) / max(left_rim_price, 1e-9)
     if not (0.10 <= depth <= BRAIN['max_cup_depth']): return None 
     
-    cup_to_now = recent.iloc[rim_idx:] 
-    if len(cup_to_now) < 21: return None 
-    handle_low = float(cup_to_now["Low"].min()) 
+    recovery_highs = find_swing_highs(highs[cup_low_abs_idx:], window=3)
+    if not recovery_highs: return None
+    right_rim_rel_idx, right_rim_price = max(recovery_highs, key=lambda x: x[1])
+    right_rim_abs_idx = cup_low_abs_idx + right_rim_rel_idx
+
+    if right_rim_price < left_rim_price * 0.85 or right_rim_price > left_rim_price * 1.05: return None
+
+    handle_section = lows[right_rim_abs_idx:]
     
-    if handle_low < (cup_low + 0.35 * (rim_price - cup_low)): return None 
+    if len(handle_section) < 3: return None 
     
-    tightness = (rim_price - handle_low) / max(rim_price, 1e-9)
+    handle_low = float(np.min(handle_section)) 
+    if handle_low < (cup_low_price + 0.35 * (left_rim_price - cup_low_price)): return None 
+    
+    tightness = (right_rim_price - handle_low) / max(right_rim_price, 1e-9)
     if tightness >= depth * 0.75: return None
+    if tightness > BRAIN['max_tightness_depth']: return None 
 
     return { 
-        "pivot_price": rim_price, 
+        "pivot_price": right_rim_price, 
         "tight_low": handle_low, 
         "tightness": tightness, 
         "type": "Cup & Handle" 
@@ -310,7 +323,7 @@ def get_multi_touch_vcp_signal(hist):
     best_group = [] 
     best_pivot = 0.0 
     for p_idx, p_val in peaks: 
-        group = [ idx for idx, val in peaks if abs(val - p_val) / max(p_val, 1e-9) <= 0.025 ] 
+        group = [ idx for idx, val in peaks if abs(val - p_val) / max(p_val, 1e-9) <= 0.04 ] 
         if len(group) > len(best_group) or ( len(group) == len(best_group) and p_val > best_pivot ): 
             best_group = group 
             best_pivot = float(np.max([highs[i] for i in group])) 
@@ -324,6 +337,9 @@ def get_multi_touch_vcp_signal(hist):
     
     if depth > BRAIN['max_base_depth'] or depth < 0.10: return None 
     
+    last_touch_idx = best_group[-1]
+    if len(highs) - last_touch_idx < 3: return None
+
     recent_low = float(np.min(lows[-15:])) 
     tightness = (best_pivot - recent_low) / max(best_pivot, 1e-9) 
     if tightness > BRAIN['max_tightness_depth']: return None 
