@@ -337,14 +337,12 @@ def get_vcp_signal(hist):
     n = len(recent)
 
     swing_highs = find_swing_highs(highs, window=4)
-    
     best_touches = []
     best_pivot = 0.0
 
     for p_idx in swing_highs:
         if p_idx > n - 3: continue
         p_val = float(highs[p_idx])
-        
         group = [i for i in swing_highs if i < n - 3 and abs(highs[i] - p_val) / max(p_val, 1e-9) <= BRAIN["pivot_tolerance"]]
         group = dedupe_indices(group, highs, min_sep=10, keep_higher=True)
         
@@ -354,42 +352,32 @@ def get_vcp_signal(hist):
                 best_touches = group
                 best_pivot = group_pivot
 
-    if len(best_touches) < BRAIN["min_touch_count"]: 
-        return None
-
+    if len(best_touches) < BRAIN["min_touch_count"]: return None
     pivot = best_pivot
     touches = best_touches
-
     first_touch = touches[0]
     last_touch = touches[-1]
 
     base_len = last_touch - first_touch
-    if base_len < BRAIN["min_base_length"] or base_len > BRAIN["max_base_length"]:
-        return None
+    if base_len < BRAIN["min_base_length"] or base_len > BRAIN["max_base_length"]: return None
 
     handle_data_len = n - last_touch
     if handle_data_len < 3: return None 
 
-    # 🚨 חוק VCP "פג תוקף": אם מאז הנגיעה האחרונה בפיבוט, המניה כבר פרצה וטסה למעלה מ-5%, ה-VCP הזה כבר לא רלוונטי!
-    if np.max(highs[last_touch:]) > pivot * 1.05:
-        return None
+    if np.max(highs[last_touch:]) > pivot * 1.05: return None
 
     base_low = float(np.min(lows[first_touch:last_touch+1]))
     base_depth = (pivot - base_low) / pivot
-
-    if base_depth < 0.10 or base_depth > BRAIN["max_base_depth"]:
-        return None
+    if base_depth < 0.10 or base_depth > BRAIN["max_base_depth"]: return None
 
     handle_low = float(np.min(lows[last_touch:]))
     handle_depth = (pivot - handle_low) / pivot
-
     if handle_depth > BRAIN["max_tightness_depth"]: return None
     if handle_depth > base_depth * 0.65: return None
 
     base_vol = np.mean(vols[first_touch:last_touch]) if base_len > 0 else 1
     handle_vol = np.mean(vols[last_touch:])
     dry_up_ratio = float(handle_vol / base_vol) if base_vol > 0 else 1.0
-
     if dry_up_ratio > BRAIN["max_dry_up_ratio"]: return None
 
     return {
@@ -453,20 +441,16 @@ def get_retest_signal(hist):
     pullback_zone_lows = lows[markup_peak_idx:]
     if len(pullback_zone_lows) == 0: return None
     lowest_since_peak = float(np.min(pullback_zone_lows))
-    
-    if lowest_since_peak < pivot * 0.965:
-        return None
+    if lowest_since_peak < pivot * 0.965: return None
 
     current_close = closes[-1]
     dist_to_pivot = (current_close / pivot) - 1.0
-
     if dist_to_pivot < -0.025 or dist_to_pivot > 0.045: return None
 
     breakout_vol = np.mean(vols[max(0, markup_peak_idx-20):markup_peak_idx+1])
     pullback_vol = np.mean(vols[-5:])
     if breakout_vol == 0: return None
     dry_up_ratio = float(pullback_vol / breakout_vol)
-    
     if dry_up_ratio > 0.85: return None
 
     current_low = float(np.min(lows[-5:]))
@@ -573,7 +557,6 @@ def scan_market():
             is_retest = False
             is_bench = False
             
-            # 🚨 סדר פעולות מתוקן: קודם בודקים ריטסט, ורק אז VCP חדש 🚨
             pattern = get_retest_signal(past_data)
             if pattern:
                 is_retest = True
@@ -589,44 +572,54 @@ def scan_market():
             close_strength = (close - float(today["Low"])) / day_range
             vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if float(today["Vol_50"]) > 0 else 0.0
 
+            stop_price = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"])) - (0.5 * float(today["ATR_14"]))
+            risk_pct = (close - stop_price) / close * 100 if close > 0 else 999
+
+            # 🚨 סינון מרחק מוחלט 🚨
+            if dist_to_pivot < -0.15 or dist_to_pivot > 0.05:
+                continue
+
+            stats["pass_pivot_dist"] += 1 # עברה את חלון הכניסה/ספסל
+
+            # הגדרת סטטוס ראשוני
             if is_retest:
                 status = "🔄 ריטסט לקו הפריצה"
-                if should_skip_spam(ticker, status): continue
-                stats["pass_pivot_dist"] += 1
             else:
                 is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
                 is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
 
                 if is_breakout:
-                    status = "🔥 פריצה פעילה!"
+                    req_close = 0.60 if is_below_150 else BRAIN["min_breakout_close_strength"]
+                    req_vol = 1.8 if is_below_150 else BRAIN["breakout_volume_ratio"]
+                    
+                    # 🚨 מערכת הורדת ליגה: מניה שפרצה אבל עם נתונים חלשים יורדת לספסל!
+                    if close_strength < req_close or vol_ratio < req_vol or ((open_price / pivot) - 1.0) > BRAIN["max_gap_above_pivot"] or close > pivot * (1 + BRAIN["max_entry_extension"]):
+                        status = "🪑 ספסל"
+                    else:
+                        status = "🔥 פריצה פעילה!"
+                        
                 elif is_near_breakout:
+                    # 🚨 בוטלו דרישות הווליום למעקב! אנחנו דווקא רוצים שיובש 🚨
                     status = "👀 מתבשלת (Watchlist)"
                 else:
-                    if dist_to_pivot < -0.15 or dist_to_pivot > 0.05:
-                        continue 
                     status = "🪑 ספסל"
 
-                if should_skip_spam(ticker, status): continue
+            # בקרת סיכון: פוסלת סטטוסים גבוהים ומורידה לספסל
+            if status != "🪑 ספסל" and status != "🔄 ריטסט לקו הפריצה": 
+                 if stop_price >= close or risk_pct > BRAIN["max_risk_pct"]:
+                     status = "🪑 ספסל"
+                     
+            if status == "🔄 ריטסט לקו הפריצה":
+                 if stop_price >= close or risk_pct > (BRAIN["max_risk_pct"] * 1.2): 
+                     status = "🪑 ספסל"
 
-                if status == "🪑 ספסל":
-                    waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
-                    is_bench = True
-                else:
-                    stats["pass_pivot_dist"] += 1
-                    if is_breakout:
-                        if close_strength < (0.60 if is_below_150 else BRAIN["min_breakout_close_strength"]): continue
-                        if vol_ratio < (1.8 if is_below_150 else BRAIN["breakout_volume_ratio"]): continue
-                        if ((open_price / pivot) - 1.0) > BRAIN["max_gap_above_pivot"]: continue
-                    else:
-                        if close_strength < 0.45 or vol_ratio < BRAIN["watchlist_volume_ratio"]: continue
+            # בדיקת ספאם סופית 
+            if should_skip_spam(ticker, status): continue
 
-                    if close > pivot * (1 + BRAIN["max_entry_extension"]): continue
-
-            stop_price = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"])) - (0.5 * float(today["ATR_14"]))
-            if stop_price >= close and not is_bench: continue
-
-            risk_pct = (close - stop_price) / close * 100
-            if risk_pct > BRAIN["max_risk_pct"] and not is_bench: continue
+            # סיווג סופי לרשימות
+            if status == "🪑 ספסל":
+                waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
+                is_bench = True
 
             alert_data = {
                 "ticker": ticker, "close": close, "pivot": pivot, "stop_loss": stop_price,
