@@ -19,7 +19,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
 CUSTOM_TICKERS_FILE = "mystock.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
-MIN_DOLLAR_VOL_50 = 30_000_000
+MIN_DOLLAR_VOL_50 = 20_000_000
 MIN_PRICE = 12.0
 COOLDOWN_DAYS = 5
 TOP_RESULTS = 10
@@ -37,12 +37,12 @@ def load_brain():
         "max_dist_from_52w_high_below_150": 0.35,
         "max_gap_above_pivot": 0.02,
         "max_entry_extension": 0.04,          
-        "breakout_volume_ratio": 1.3,         # מעט הוגמש ל-130% ווליום בפריצה
+        "breakout_volume_ratio": 1.3,         
         "watchlist_volume_ratio": 0.75,
-        "pivot_tolerance": 0.035,             # מאפשר סטייה קלה של 3.5% לקו ההתנגדות
-        "min_base_length": 20,                # בסיס מינימלי: 4 שבועות (כמו שמינרוויני מאשר)
+        "pivot_tolerance": 0.035,             
+        "min_base_length": 20,                
         "max_base_length": 200,
-        "max_dry_up_ratio": 0.85,             # הידית צריכה להיות שקטה מהבסיס (85% מהווליום)
+        "max_dry_up_ratio": 0.85,             
         "watchlist_max_dist": 0.06,           
         "min_touch_count": 2,
         "max_risk_pct": 12.0,
@@ -208,6 +208,8 @@ def normalize_ohlcv_columns(df):
 
 def add_indicators(df):
     df = normalize_ohlcv_columns(df)
+    
+    # מינימום תקופות שמונע קריסה ובאגים במשפך הסינון
     df["SMA_21"] = df["Close"].rolling(21, min_periods=10).mean()
     df["SMA_50"] = df["Close"].rolling(50, min_periods=25).mean()
     df["SMA_150"] = df["Close"].rolling(150, min_periods=75).mean()
@@ -286,7 +288,7 @@ def check_market_cap(ticker):
     return market_cap
 
 # ==========================================
-# 5. מנוע זיהוי תבניות VCP קשוח (מחודש ונקי)
+# 5. מנוע זיהוי תבניות חכם (Cluster Pivot)
 # ==========================================
 def find_swing_highs(arr, window=4):
     arr = np.asarray(arr, dtype=float)
@@ -304,7 +306,6 @@ def dedupe_indices(indices, values, min_sep=10, keep_higher=True):
     kept = [indices[0]]
     for idx in indices[1:]:
         last = kept[-1]
-        # מרווח הגיוני בין נגיעות: לפחות שבועיים (10 ימי מסחר)
         if idx - last >= min_sep:
             kept.append(idx)
         else:
@@ -323,21 +324,33 @@ def get_vcp_signal(hist):
     vols = recent["Volume"].astype(float).values
     n = len(recent)
 
-    # 1. מציאת הפיבוט ההיסטורי (מתעלם מ-5 הימים האחרונים)
-    pivot = float(np.max(highs[:-5]))
-    if not np.isfinite(pivot) or pivot <= 0: return None
-
-    # 2. מציאת כל הנגיעות באזור הפיבוט (כולל השפה השמאלית והימנית)
     swing_highs = find_swing_highs(highs, window=4)
-    touch_candidates = [i for i in swing_highs if highs[i] >= pivot * (1 - BRAIN["pivot_tolerance"]) and i < n - 3]
-    touches = dedupe_indices(touch_candidates, highs, min_sep=10, keep_higher=True)
+    
+    best_touches = []
+    best_pivot = 0.0
 
-    if len(touches) < BRAIN["min_touch_count"]: return None
+    for p_idx in swing_highs:
+        if p_idx > n - 3: continue
+        p_val = float(highs[p_idx])
+        
+        group = [i for i in swing_highs if i < n - 3 and abs(highs[i] - p_val) / max(p_val, 1e-9) <= BRAIN["pivot_tolerance"]]
+        group = dedupe_indices(group, highs, min_sep=10, keep_higher=True)
+        
+        if len(group) >= BRAIN["min_touch_count"]:
+            group_pivot = float(np.max([highs[i] for i in group]))
+            if len(group) > len(best_touches) or (len(group) == len(best_touches) and group_pivot > best_pivot):
+                best_touches = group
+                best_pivot = group_pivot
+
+    if len(best_touches) < BRAIN["min_touch_count"]: 
+        return None
+
+    pivot = best_pivot
+    touches = best_touches
 
     first_touch = touches[0]
     last_touch = touches[-1]
 
-    # 3. בדיקת מאקרו על הבסיס (בין השפה השמאלית לימנית)
     base_len = last_touch - first_touch
     if base_len < BRAIN["min_base_length"] or base_len > BRAIN["max_base_length"]:
         return None
@@ -348,19 +361,15 @@ def get_vcp_signal(hist):
     if base_depth < 0.10 or base_depth > BRAIN["max_base_depth"]:
         return None
 
-    # 4. בדיקת הידית / הכיווץ (מה קרה *אחרי* הנגיעה האחרונה)
     handle_data_len = n - last_touch
-    if handle_data_len < 3: return None # חייב מינימום 3 ימים לידית
+    if handle_data_len < 3: return None 
 
     handle_low = float(np.min(lows[last_touch:]))
     handle_depth = (pivot - handle_low) / pivot
 
     if handle_depth > BRAIN["max_tightness_depth"]: return None
-    
-    # חוק התכווצות ברזל: הידית חייבת להיות התכווצות ברורה של הבסיס (גג 65% מעומקו)
     if handle_depth > base_depth * 0.65: return None
 
-    # 5. בדיקת התייבשות ווליום (Dry-Up)
     base_vol = np.mean(vols[first_touch:last_touch]) if base_len > 0 else 1
     handle_vol = np.mean(vols[last_touch:])
     dry_up_ratio = float(handle_vol / base_vol) if base_vol > 0 else 1.0
@@ -380,7 +389,7 @@ def get_vcp_signal(hist):
     }
 
 # ==========================================
-# מנוע זיהוי ריטסטים נפרד (Pullbacks) 🔄
+# מנוע זיהוי ריטסטים נפרד (Pullbacks) 🔄 
 # ==========================================
 def get_retest_signal(hist):
     recent = hist.tail(300).copy()
@@ -401,22 +410,40 @@ def get_retest_signal(hist):
     pre_breakout_highs = highs[:markup_peak_idx]
     if len(pre_breakout_highs) < 40: return None
 
-    pivot = float(np.max(pre_breakout_highs[:-5]))
-    if not np.isfinite(pivot) or pivot <= 0: return None
+    swing_highs = find_swing_highs(pre_breakout_highs, window=4)
+    best_touches = []
+    best_pivot = 0.0
+
+    for p_idx in swing_highs:
+        if p_idx > len(pre_breakout_highs) - 3: continue
+        p_val = float(pre_breakout_highs[p_idx])
+        group = [i for i in swing_highs if i < len(pre_breakout_highs) - 3 and abs(pre_breakout_highs[i] - p_val) / max(p_val, 1e-9) <= BRAIN["pivot_tolerance"]]
+        group = dedupe_indices(group, pre_breakout_highs, min_sep=10, keep_higher=True)
+        
+        if len(group) >= BRAIN["min_touch_count"]:
+            group_pivot = float(np.max([pre_breakout_highs[i] for i in group]))
+            if len(group) > len(best_touches) or (len(group) == len(best_touches) and group_pivot > best_pivot):
+                best_touches = group
+                best_pivot = group_pivot
+
+    if len(best_touches) < BRAIN["min_touch_count"]: return None
+    pivot = best_pivot
 
     if markup_peak_val < pivot * 1.08: return None
-
-    swing_window = int(BRAIN.get("swing_window", 4))
-    swing_highs = find_swing_highs(pre_breakout_highs, window=swing_window)
-    touch_candidates = [i for i in swing_highs if pre_breakout_highs[i] >= pivot * 0.96]
-    touches = dedupe_indices(touch_candidates, pre_breakout_highs, min_sep=15, keep_higher=True)
     
-    if len(touches) < 2: return None
-    base_len = touches[-1] - touches[0]
+    base_len = best_touches[-1] - best_touches[0]
     if base_len < 20: return None
     
-    base_low = float(np.min(lows[touches[0]:markup_peak_idx]))
+    base_low = float(np.min(lows[best_touches[0]:markup_peak_idx]))
     base_depth = (pivot - base_low) / pivot
+
+    # 🚨 התיקון הקריטי: חוק רצפת הבטון (מחסל מניות שבורות כמו NATL)
+    pullback_zone_lows = lows[markup_peak_idx:]
+    if len(pullback_zone_lows) == 0: return None
+    lowest_since_peak = float(np.min(pullback_zone_lows))
+    
+    if lowest_since_peak < pivot * 0.965:
+        return None
 
     current_close = closes[-1]
     dist_to_pivot = (current_close / pivot) - 1.0
@@ -440,7 +467,7 @@ def get_retest_signal(hist):
         "tightness": pullback_depth, 
         "base_depth": base_depth,
         "dry_up_ratio": dry_up_ratio,
-        "touches": len(touches),
+        "touches": len(best_touches),
         "base_length": base_len,
         "type": "Retest"
     }
