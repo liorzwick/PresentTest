@@ -222,19 +222,20 @@ def normalize_ohlcv_columns(df):
 def add_indicators(df):
     df = normalize_ohlcv_columns(df)
 
-    df["SMA_21"] = df["Close"].rolling(21).mean()
-    df["SMA_50"] = df["Close"].rolling(50).mean()
-    df["SMA_150"] = df["Close"].rolling(150).mean()
-    df["SMA_200"] = df["Close"].rolling(200).mean()
+    # הוספת min_periods כדי למנוע NaN כשיש פחות מ-200/252 ימים
+    df["SMA_21"] = df["Close"].rolling(21, min_periods=10).mean()
+    df["SMA_50"] = df["Close"].rolling(50, min_periods=25).mean()
+    df["SMA_150"] = df["Close"].rolling(150, min_periods=75).mean()
+    df["SMA_200"] = df["Close"].rolling(200, min_periods=100).mean()
 
-    df["Vol_10"] = df["Volume"].rolling(10).mean()
-    df["Vol_20"] = df["Volume"].rolling(20).mean()
-    df["Vol_50"] = df["Volume"].rolling(50).mean()
-    df["DollarVol_50"] = df["Close"].rolling(50).mean() * df["Vol_50"]
+    df["Vol_10"] = df["Volume"].rolling(10, min_periods=5).mean()
+    df["Vol_20"] = df["Volume"].rolling(20, min_periods=10).mean()
+    df["Vol_50"] = df["Volume"].rolling(50, min_periods=25).mean()
+    df["DollarVol_50"] = df["Close"].rolling(50, min_periods=25).mean() * df["Vol_50"]
 
     df["Prev_Close"] = df["Close"].shift(1)
     df["ROC_65"] = df["Close"].pct_change(65)
-    df["High_252"] = df["High"].rolling(252).max()
+    df["High_252"] = df["High"].rolling(252, min_periods=120).max()
 
     tr = pd.concat(
         [
@@ -245,11 +246,12 @@ def add_indicators(df):
         axis=1
     ).max(axis=1)
 
-    df["ATR_14"] = tr.rolling(14).mean()
+    df["ATR_14"] = tr.rolling(14, min_periods=7).mean()
     df["ATR_Pct"] = df["ATR_14"] / df["Close"]
     df["Range_Pct"] = (df["High"] - df["Low"]) / df["Close"]
 
     return df
+
 
 
 def get_spy_data():
