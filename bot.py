@@ -27,11 +27,10 @@ SCAN_PERIOD = "1y"
 
 market_cap_cache = {}
 
-
 def load_brain():
     brain = {
-        "max_base_depth": 0.32,
-        "max_tightness_depth": 0.08,
+        "max_base_depth": 0.65,               # הורחב כדי לתפוס גם התאוששויות עמוקות (Turnarounds כמו HUN)
+        "max_tightness_depth": 0.15,          # הורחב כדי לאפשר כיווץ הגיוני לשוק הנוכחי
         "min_breakout_close_strength": 0.55,
         "min_rs_65": 0.03,
         "max_dist_from_52w_high_normal": 0.18,
@@ -43,8 +42,8 @@ def load_brain():
         "min_contractions": 2,
         "max_contractions": 4,
         "pivot_tolerance": 0.03,
-        "min_base_length": 25,
-        "max_base_length": 120,
+        "min_base_length": 40,                # 🚨 תוקן! בסיס חייב להיות לפחות חודשיים (פסילת מיקרו-תבניות כמו FTS)
+        "max_base_length": 200,
         "max_dry_up_ratio": 0.78,
         "atr_contraction_ratio": 0.95,
         "watchlist_max_dist": 0.06,           
@@ -222,7 +221,7 @@ def normalize_ohlcv_columns(df):
 def add_indicators(df):
     df = normalize_ohlcv_columns(df)
 
-    # הוספת min_periods כדי למנוע NaN כשיש פחות מ-200/252 ימים
+    # הוספת min_periods פותרת את בעיית הקריסה בשלב 1
     df["SMA_21"] = df["Close"].rolling(21, min_periods=10).mean()
     df["SMA_50"] = df["Close"].rolling(50, min_periods=25).mean()
     df["SMA_150"] = df["Close"].rolling(150, min_periods=75).mean()
@@ -251,7 +250,6 @@ def add_indicators(df):
     df["Range_Pct"] = (df["High"] - df["Low"]) / df["Close"]
 
     return df
-
 
 
 def get_spy_data():
@@ -333,7 +331,7 @@ def check_market_cap(ticker):
 
 
 # ==========================================
-# 5. Swing points ו-detectors
+# 5. Swing points ו-detectors מותאמים חומרה 🚨
 # ==========================================
 def find_swing_highs(arr, window=4):
     arr = np.asarray(arr, dtype=float)
@@ -365,7 +363,7 @@ def find_swing_lows(arr, window=4):
     return lows
 
 
-def dedupe_indices(indices, values, min_sep=6, keep_higher=True):
+def dedupe_indices(indices, values, min_sep=25, keep_higher=True):
     if not indices:
         return []
 
@@ -374,6 +372,7 @@ def dedupe_indices(indices, values, min_sep=6, keep_higher=True):
 
     for idx in indices[1:]:
         last = kept[-1]
+        # 🚨 חוק מרחק: חייבים להיות במרחק של לפחות חודש אחד מהשני
         if idx - last >= min_sep:
             kept.append(idx)
         else:
@@ -386,7 +385,7 @@ def dedupe_indices(indices, values, min_sep=6, keep_higher=True):
 
 
 def get_vcp_signal(hist):
-    recent = hist.tail(180).copy()
+    recent = hist.tail(250).copy() # מסתכל 250 ימים (שנה) אחורה כדי לתפוס תבניות כמו FTNT
     if len(recent) < 80:
         return None
 
@@ -394,7 +393,6 @@ def get_vcp_signal(hist):
     lows = recent["Low"].astype(float).values
     vols = recent["Volume"].astype(float).values
     closes = recent["Close"].astype(float).values
-    atr_pct = recent["ATR_Pct"].astype(float).values
     n = len(recent)
 
     pivot = float(np.max(highs[:-5]))
@@ -413,7 +411,8 @@ def get_vcp_signal(hist):
         raw_hits = np.where(highs[:-3] >= pivot * (1 - BRAIN["pivot_tolerance"]))[0].tolist()
         touch_candidates = raw_hits
 
-    touches = dedupe_indices(touch_candidates, highs, min_sep=6, keep_higher=True)
+    # 🚨 חוק מרחק בזמן: מינימום 25 ימי מסחר (יותר מחודש) בין נגיעה לנגיעה! (מחסל מניות רועשות)
+    touches = dedupe_indices(touch_candidates, highs, min_sep=25, keep_higher=True)
 
     if len(touches) < BRAIN["min_touch_count"]:
         return None
@@ -426,7 +425,8 @@ def get_vcp_signal(hist):
     base_end = n - 1
     base_len = base_end - base_start + 1
 
-    if base_len < BRAIN["min_base_length"] or base_len > (BRAIN["max_base_length"] + 25):
+    # 🚨 חוק אורך בסיס: תבנית חייבת להתבשל לפחות חודשיים-שלושה.
+    if base_len < BRAIN["min_base_length"]:
         return None
 
     depths = []
@@ -444,7 +444,8 @@ def get_vcp_signal(hist):
     if len(depths) < BRAIN["min_contractions"]:
         return None
 
-    if len(depths) > BRAIN["max_contractions"]:
+    # 🚨 חוק עומק מינימלי: מסנן ירידות זעירות של 4%-6% כמו שראינו ב-FTS. חייב לרדת לפחות 10% לניעור.
+    if max(depths) < 0.10:
         return None
 
     if max(depths) > BRAIN["max_base_depth"]:
@@ -453,15 +454,13 @@ def get_vcp_signal(hist):
     if depths[-1] > BRAIN["max_tightness_depth"]:
         return None
 
-    decreasing_steps = sum(depths[i + 1] <= depths[i] * 1.15 for i in range(len(depths) - 1))
-    if decreasing_steps < len(depths) - 1:
+    # 🚨 התכווצות: התיקון האחרון (ידית) חייב להיות קטן בחצי מההתרסקות המקסימלית (מקסימום 55% מעומק הבסיס)
+    if depths[-1] > max(depths) * 0.55:
         return None
 
-    if depths[-1] >= depths[0] * 1.15:
-        return None
-
+    # שפלים עולים (בסלחנות כדי לאפשר Shakeout קל)
     low_prices = [x[1] for x in pullback_lows]
-    if len(low_prices) >= 2 and low_prices[-1] < low_prices[0] * 0.98:
+    if len(low_prices) >= 2 and low_prices[-1] < low_prices[0] * 0.95:
         return None
 
     base_df = recent.iloc[base_start:base_end + 1].copy()
@@ -512,8 +511,8 @@ def get_vcp_signal(hist):
 
 
 def get_flat_base_signal(hist):
-    recent = hist.tail(60).copy()
-    if len(recent) < 30:
+    recent = hist.tail(120).copy() # מסתכל חצי שנה אחורה
+    if len(recent) < 45: # 🚨 בסיס שטוח חייב להיות לפחות 45 ימי מסחר
         return None
 
     highs = recent["High"].astype(float)
@@ -524,7 +523,8 @@ def get_flat_base_signal(hist):
     low = float(lows.min())
     depth = (pivot - low) / pivot if pivot > 0 else 999
 
-    if not (0.04 <= depth <= 0.15):
+    # 🚨 עומק בסיס שטוח חייב להיות לפחות 10% כדי להעיף מניות רועשות
+    if not (0.10 <= depth <= 0.25):
         return None
 
     last_15 = recent.tail(15)
@@ -599,7 +599,7 @@ def scan_market():
             market_warning = "⚠️ <b>שים לב: השוק הכללי לא במצב אידיאלי לפריצות.</b> הסריקה ממשיכה, אך הסיכון לפריצות שווא גבוה.\n\n"
 
     all_potentials = []
-    waiting_for_pivot_tickers = [] # רשימת ה"ספסל" למניות שלפני שלב הפיבוט
+    waiting_for_pivot_tickers = [] 
 
     stats = {
         "total_scanned": 0,
@@ -700,7 +700,6 @@ def scan_market():
             is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
             is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
 
-            # --- הוספת מניות לספסל אם הן לא בטווח הפיבוט ---
             if not (is_breakout or is_near_breakout):
                 waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
                 continue
@@ -795,7 +794,6 @@ def scan_market():
     print(f"🏆 אושרו סופית (לאחר ספאם, סיכון וכו'): {stats['final_approved']}")
     print("=" * 50)
     
-    # הדפסת ה"ספסל" במסך של גיטהאב
     print("\n👀 מניות שעברו זיהוי תבנית תקינה אך עדיין רחוקות מהפיבוט (שלב לפני אחרון):")
     if waiting_for_pivot_tickers:
         print(", ".join(waiting_for_pivot_tickers))
@@ -803,7 +801,6 @@ def scan_market():
         print("אין מניות כאלו כרגע.")
     print("=" * 50)
 
-    # מיון לפי ציון setup ואז לפי קרבה לפיבוט
     all_potentials_sorted = sorted(
         all_potentials,
         key=lambda x: (-x["setup_score"], abs(x["dist_to_pivot"]))
