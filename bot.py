@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore")
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
-CUSTOM_TICKERS_FILE = "mystock.csv"
+CUSTOM_TICKERS_FILE = "my_stocks.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
 MIN_DOLLAR_VOL_50 = 20_000_000
@@ -81,11 +81,9 @@ def append_dataframe(df, file_path):
 
 
 def send_telegram(message):
-    print("
-=== תוכן ההודעה המלאה ===")
+    print("\n=== תוכן ההודעה המלאה ===")
     print(message)
-    print("=========================
-")
+    print("=========================\n")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ מצב סימולציה - הטוקן או ה-ID חסרים ב-GitHub Secrets")
@@ -592,21 +590,16 @@ def scan_market():
     spy_rs = 0.0
 
     if spy.empty:
-        market_warning = "🔴 <b>שגיאה: לא ניתן למשוך נתוני שוק (SPY).</b> הסריקה ממשיכה ללא פילטר מגמה.
-
-"
+        market_warning = "🔴 <b>שגיאה: לא ניתן למשוך נתוני שוק (SPY).</b> הסריקה ממשיכה ללא פילטר מגמה.\n\n"
     else:
         spy_rs = float(spy.iloc[-1]["ROC_65"]) if pd.notna(spy.iloc[-1]["ROC_65"]) else 0.0
         if not market_filter_ok(spy):
-            market_warning = "⚠️ <b>שים לב: השוק הכללי לא במצב אידיאלי לפריצות.</b> הסריקה ממשיכה, אך הסיכון לפריצות שווא גבוה.
-
-"
+            market_warning = "⚠️ <b>שים לב: השוק הכללי לא במצב אידיאלי לפריצות.</b> הסריקה ממשיכה, אך הסיכון לפריצות שווא גבוה.\n\n"
 
     all_potentials = []
 
     for ticker in tickers:
-        print(f"סורק את {ticker}...", end="
-")
+        print(f"סורק את {ticker}...", end="\r")
 
         try:
             df = yf.download(ticker, period=SCAN_PERIOD, auto_adjust=True, progress=False)
@@ -751,8 +744,7 @@ def scan_market():
 
         time.sleep(0.15)
 
-    print("
-" + "=" * 50)
+    print("\n" + "=" * 50)
 
     # מיון לפי ציון setup ואז לפי קרבה לפיבוט
     all_potentials_sorted = sorted(
@@ -781,38 +773,26 @@ def scan_market():
     if total_sent > 0:
         print(f"🔥 הסריקה הסתיימה! נמצאו {total_sent} מניות לשליחה.")
 
-        msg = "🎯 <b>סריקת VCP יומית הסתיימה!</b>
-"
+        msg = "🎯 <b>סריקת VCP יומית הסתיימה!</b>\n"
         if market_warning:
             msg += market_warning
 
-        msg += f"<i>(מציג {total_sent} מניות מדורגות לפי איכות setup. מקסימום 3 מתחת לממוצע 150)</i>
-
-"
+        msg += f"<i>(מציג {total_sent} מניות מדורגות לפי איכות setup. מקסימום 3 מתחת לממוצע 150)</i>\n\n"
 
         if final_bo:
-            msg += f"🔥 <b>פריצות אקטיביות ({len(final_bo)}):</b>
-
-"
+            msg += f"🔥 <b>פריצות אקטיביות ({len(final_bo)}):</b>\n\n"
 
             for a in final_bo:
                 tv_link = f"https://il.tradingview.com/chart/?symbol={a['ticker']}"
                 warning_150 = " ⚠️ (מתחת ל-150)" if a["is_below_150"] else ""
 
-                msg += f"🚀 <b>{a['ticker']}</b> | {a['type']}{warning_150}
-"
-                msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}% | 📊 <b>ווליום:</b> {a['vol_ratio']:.1f}x
-"
-                msg += f"📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}% | 🫗 <b>Dry-Up:</b> {a['dry_up_ratio']:.2f} | 🔋 <b>סגירה:</b> {a['close_strength'] * 100:.0f}%
-"
-                msg += f"🔁 <b>Contractions:</b> {a['contraction_text']} | 🎯 <b>פיבוט:</b> ${a['pivot']:.2f}
-"
-                msg += f"💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f} (סיכון: {a['risk_pct']:.1f}%-)
-"
-                msg += f"🔗 <a href='{tv_link}'>גרף ב-TradingView</a>
-"
-                msg += "────────────────
-"
+                msg += f"🚀 <b>{a['ticker']}</b> | {a['type']}{warning_150}\n"
+                msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}% | 📊 <b>ווליום:</b> {a['vol_ratio']:.1f}x\n"
+                msg += f"📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}% | 🫗 <b>Dry-Up:</b> {a['dry_up_ratio']:.2f} | 🔋 <b>סגירה:</b> {a['close_strength'] * 100:.0f}%\n"
+                msg += f"🔁 <b>Contractions:</b> {a['contraction_text']} | 🎯 <b>פיבוט:</b> ${a['pivot']:.2f}\n"
+                msg += f"💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f} (סיכון: {a['risk_pct']:.1f}%-)\n"
+                msg += f"🔗 <a href='{tv_link}'>גרף ב-TradingView</a>\n"
+                msg += "────────────────\n"
 
                 log_signal(a["ticker"], a["close"], a["status"])
                 save_to_smart_memory(
@@ -823,28 +803,19 @@ def scan_market():
                 )
 
         if final_wl:
-            msg += f"👀 <b>מתבשלות למעקב ({len(final_wl)}):</b>
-
-"
+            msg += f"👀 <b>מתבשלות למעקב ({len(final_wl)}):</b>\n\n"
 
             for a in final_wl:
                 tv_link = f"https://il.tradingview.com/chart/?symbol={a['ticker']}"
                 warning_150 = " ⚠️ (מתחת ל-150)" if a["is_below_150"] else ""
 
-                msg += f"⏳ <b>{a['ticker']}</b> | {a['type']}{warning_150}
-"
-                msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}% | 📊 <b>ווליום:</b> {a['vol_ratio']:.1f}x
-"
-                msg += f"📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}% | 🫗 <b>Dry-Up:</b> {a['dry_up_ratio']:.2f} | 🔋 <b>סגירה:</b> {a['close_strength'] * 100:.0f}%
-"
-                msg += f"🔁 <b>Contractions:</b> {a['contraction_text']} | 🎯 <b>פיבוט:</b> ${a['pivot']:.2f} (מרחק: {a['dist_to_pivot'] * 100:.1f}%)
-"
-                msg += f"💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ משוער:</b> ${a['stop_loss']:.2f} (סיכון: {a['risk_pct']:.1f}%-)
-"
-                msg += f"🔗 <a href='{tv_link}'>גרף ב-TradingView</a>
-"
-                msg += "────────────────
-"
+                msg += f"⏳ <b>{a['ticker']}</b> | {a['type']}{warning_150}\n"
+                msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}% | 📊 <b>ווליום:</b> {a['vol_ratio']:.1f}x\n"
+                msg += f"📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}% | 🫗 <b>Dry-Up:</b> {a['dry_up_ratio']:.2f} | 🔋 <b>סגירה:</b> {a['close_strength'] * 100:.0f}%\n"
+                msg += f"🔁 <b>Contractions:</b> {a['contraction_text']} | 🎯 <b>פיבוט:</b> ${a['pivot']:.2f} (מרחק: {a['dist_to_pivot'] * 100:.1f}%)\n"
+                msg += f"💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ משוער:</b> ${a['stop_loss']:.2f} (סיכון: {a['risk_pct']:.1f}%-)\n"
+                msg += f"🔗 <a href='{tv_link}'>גרף ב-TradingView</a>\n"
+                msg += "────────────────\n"
 
                 log_signal(a["ticker"], a["close"], a["status"])
                 save_to_smart_memory(
@@ -859,9 +830,7 @@ def scan_market():
     else:
         print("💤 הסריקה הסתיימה. לא נמצאו מניות חדשות לשליחה בסיבוב זה.")
         send_telegram(
-            f"✅ הסריקה הסתיימה.
-
-{market_warning}"
+            f"✅ הסריקה הסתיימה.\n\n{market_warning}"
             f"אין פריצות או מניות חדשות במעקב שלא נשלחו כבר היום."
         )
 
@@ -869,4 +838,4 @@ def scan_market():
 
 
 if __name__ == "__main__":
-    scan_market() 
+    scan_market()
