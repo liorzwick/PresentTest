@@ -141,16 +141,13 @@ def save_to_smart_memory(
 
     append_dataframe(new_record, memory_file)
 
-def should_skip_spam(ticker, is_breakout):
+def should_skip_spam(ticker, current_status):
     log_file = "trading_log.csv"
     if not os.path.isfile(log_file):
         return False
 
     try:
         df = pd.read_csv(log_file, encoding="utf-8-sig")
-        if df.empty:
-            return False
-
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"])
 
@@ -158,13 +155,29 @@ def should_skip_spam(ticker, is_breakout):
         if ticker_history.empty:
             return False
 
-        last_sent = ticker_history.iloc[0]["Date"]
+        last_record = ticker_history.iloc[0]
+        last_date = last_record["Date"]
+        last_status = str(last_record.get("Status", ""))
+        days_passed = (datetime.now() - last_date).days
 
-        if is_breakout:
-            return last_sent.date() == datetime.now().date()
+        if last_date.date() == datetime.now().date() and last_status == current_status:
+            return True
 
-        days_passed = (datetime.now() - last_sent).days
+        is_curr_breakout = "פריצה" in current_status
+        is_curr_watch = "מתבשלת" in current_status
+
+        if is_curr_breakout:
+            if "פריצה" in last_status and days_passed < 2:
+                return True
+            return False 
+
+        if is_curr_watch:
+            if ("מתבשלת" in last_status or "פריצה" in last_status) and days_passed < COOLDOWN_DAYS:
+                return True
+            return False 
+
         return days_passed < COOLDOWN_DAYS
+
     except Exception:
         return False
 
@@ -208,8 +221,6 @@ def normalize_ohlcv_columns(df):
 
 def add_indicators(df):
     df = normalize_ohlcv_columns(df)
-    
-    # מינימום תקופות שמונע קריסה ובאגים במשפך הסינון
     df["SMA_21"] = df["Close"].rolling(21, min_periods=10).mean()
     df["SMA_50"] = df["Close"].rolling(50, min_periods=25).mean()
     df["SMA_150"] = df["Close"].rolling(150, min_periods=75).mean()
@@ -322,6 +333,7 @@ def get_vcp_signal(hist):
     highs = recent["High"].astype(float).values
     lows = recent["Low"].astype(float).values
     vols = recent["Volume"].astype(float).values
+    closes = recent["Close"].astype(float).values
     n = len(recent)
 
     swing_highs = find_swing_highs(highs, window=4)
@@ -355,14 +367,18 @@ def get_vcp_signal(hist):
     if base_len < BRAIN["min_base_length"] or base_len > BRAIN["max_base_length"]:
         return None
 
+    handle_data_len = n - last_touch
+    if handle_data_len < 3: return None 
+
+    # 🚨 חוק VCP "פג תוקף": אם מאז הנגיעה האחרונה בפיבוט, המניה כבר פרצה וטסה למעלה מ-5%, ה-VCP הזה כבר לא רלוונטי!
+    if np.max(highs[last_touch:]) > pivot * 1.05:
+        return None
+
     base_low = float(np.min(lows[first_touch:last_touch+1]))
     base_depth = (pivot - base_low) / pivot
 
     if base_depth < 0.10 or base_depth > BRAIN["max_base_depth"]:
         return None
-
-    handle_data_len = n - last_touch
-    if handle_data_len < 3: return None 
 
     handle_low = float(np.min(lows[last_touch:]))
     handle_depth = (pivot - handle_low) / pivot
@@ -388,9 +404,6 @@ def get_vcp_signal(hist):
         "type": "VCP"
     }
 
-# ==========================================
-# מנוע זיהוי ריטסטים נפרד (Pullbacks) 🔄 
-# ==========================================
 def get_retest_signal(hist):
     recent = hist.tail(300).copy()
     if len(recent) < 100: return None
@@ -437,7 +450,6 @@ def get_retest_signal(hist):
     base_low = float(np.min(lows[best_touches[0]:markup_peak_idx]))
     base_depth = (pivot - base_low) / pivot
 
-    # 🚨 התיקון הקריטי: חוק רצפת הבטון (מחסל מניות שבורות כמו NATL)
     pullback_zone_lows = lows[markup_peak_idx:]
     if len(pullback_zone_lows) == 0: return None
     lowest_since_peak = float(np.min(pullback_zone_lows))
@@ -559,10 +571,15 @@ def scan_market():
             stats["pass_market_cap"] += 1
 
             is_retest = False
-            pattern = get_vcp_signal(past_data)
-            if not pattern:
-                pattern = get_retest_signal(past_data)
-                if pattern: is_retest = True
+            is_bench = False
+            
+            # 🚨 סדר פעולות מתוקן: קודם בודקים ריטסט, ורק אז VCP חדש 🚨
+            pattern = get_retest_signal(past_data)
+            if pattern:
+                is_retest = True
+            else:
+                pattern = get_vcp_signal(past_data)
+            
             if not pattern: continue
             stats["pass_pattern"] += 1
 
@@ -574,35 +591,42 @@ def scan_market():
 
             if is_retest:
                 status = "🔄 ריטסט לקו הפריצה"
+                if should_skip_spam(ticker, status): continue
                 stats["pass_pivot_dist"] += 1
-                if should_skip_spam(ticker, False): continue
             else:
                 is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
                 is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
 
-                if not (is_breakout or is_near_breakout):
-                    waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
-                    continue
-                stats["pass_pivot_dist"] += 1
-
-                if should_skip_spam(ticker, is_breakout): continue
-
                 if is_breakout:
-                    if close_strength < (0.60 if is_below_150 else BRAIN["min_breakout_close_strength"]): continue
-                    if vol_ratio < (1.8 if is_below_150 else BRAIN["breakout_volume_ratio"]): continue
-                    if ((open_price / pivot) - 1.0) > BRAIN["max_gap_above_pivot"]: continue
                     status = "🔥 פריצה פעילה!"
-                else:
-                    if close_strength < 0.45 or vol_ratio < BRAIN["watchlist_volume_ratio"]: continue
+                elif is_near_breakout:
                     status = "👀 מתבשלת (Watchlist)"
+                else:
+                    if dist_to_pivot < -0.15 or dist_to_pivot > 0.05:
+                        continue 
+                    status = "🪑 ספסל"
 
-                if close > pivot * (1 + BRAIN["max_entry_extension"]): continue
+                if should_skip_spam(ticker, status): continue
+
+                if status == "🪑 ספסל":
+                    waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
+                    is_bench = True
+                else:
+                    stats["pass_pivot_dist"] += 1
+                    if is_breakout:
+                        if close_strength < (0.60 if is_below_150 else BRAIN["min_breakout_close_strength"]): continue
+                        if vol_ratio < (1.8 if is_below_150 else BRAIN["breakout_volume_ratio"]): continue
+                        if ((open_price / pivot) - 1.0) > BRAIN["max_gap_above_pivot"]: continue
+                    else:
+                        if close_strength < 0.45 or vol_ratio < BRAIN["watchlist_volume_ratio"]: continue
+
+                    if close > pivot * (1 + BRAIN["max_entry_extension"]): continue
 
             stop_price = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"])) - (0.5 * float(today["ATR_14"]))
-            if stop_price >= close: continue
+            if stop_price >= close and not is_bench: continue
 
             risk_pct = (close - stop_price) / close * 100
-            if risk_pct > BRAIN["max_risk_pct"]: continue
+            if risk_pct > BRAIN["max_risk_pct"] and not is_bench: continue
 
             alert_data = {
                 "ticker": ticker, "close": close, "pivot": pivot, "stop_loss": stop_price,
@@ -636,18 +660,32 @@ def scan_market():
     print(f"🏆 אושרו סופית (לאחר ספאם, סיכון וכו'): {stats['final_approved']}")
     print("=" * 50)
     
-    print("\n👀 ספסל - מניות שעברו תבנית אך רחוקות מהפיבוט:")
+    print("\n👀 יומן ספסל מלא (מניות שעברו תבנית אך רחוקות מהפיבוט):")
     if waiting_for_pivot_tickers:
         print(", ".join(waiting_for_pivot_tickers))
     else:
         print("אין מניות כאלו כרגע.")
     print("=" * 50)
 
-    all_potentials_sorted = sorted(all_potentials, key=lambda x: (-x["setup_score"], abs(x["dist_to_pivot"])))
+    prime_potentials = [s for s in all_potentials if s["status"] != "🪑 ספסל"]
+    bench_potentials = [s for s in all_potentials if s["status"] == "🪑 ספסל"]
+
+    prime_potentials = sorted(prime_potentials, key=lambda x: (-x["setup_score"], abs(x["dist_to_pivot"])))
+    bench_potentials = sorted(bench_potentials, key=lambda x: abs(x["dist_to_pivot"]))
+
     final_selection = []
     below_150_count = 0
 
-    for stock in all_potentials_sorted:
+    for stock in prime_potentials:
+        if len(final_selection) >= TOP_RESULTS: break
+        if stock["is_below_150"]:
+            if below_150_count < 3:
+                final_selection.append(stock)
+                below_150_count += 1
+        else:
+            final_selection.append(stock)
+
+    for stock in bench_potentials:
         if len(final_selection) >= TOP_RESULTS: break
         if stock["is_below_150"]:
             if below_150_count < 3:
@@ -659,11 +697,14 @@ def scan_market():
     final_bo = [s for s in final_selection if "פריצה פעילה" in s["status"]]
     final_wl = [s for s in final_selection if "מתבשלת" in s["status"]]
     final_rt = [s for s in final_selection if "ריטסט" in s["status"]]
+    final_bench = [s for s in final_selection if "ספסל" in s["status"]]
 
     if final_selection:
-        print(f"🔥 הסריקה הסתיימה! נמצאו {len(final_selection)} מניות לשליחה.")
+        print(f"🔥 הסריקה הסתיימה! מציג {len(final_selection)} מניות (כולל השלמות ספסל) לשליחה.")
         msg = "🎯 <b>סריקת VCP וריטסטים יומית הסתיימה!</b>\n"
         if market_warning: msg += market_warning
+
+        msg += f"<i>(מציג עד {TOP_RESULTS} מניות. הושלם מהספסל במידת הצורך)</i>\n\n"
 
         if final_bo:
             msg += f"🔥 <b>פריצות אקטיביות ({len(final_bo)}):</b>\n\n"
@@ -687,6 +728,14 @@ def scan_market():
                 tv_link = f"https://il.tradingview.com/chart/?symbol={a['ticker']}"
                 warn = " ⚠️ (שיקום)" if a["is_below_150"] else ""
                 msg += f"⏳ <b>{a['ticker']}</b> | VCP {warn}\n⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}%\n🎯 <b>פיבוט יעד:</b> ${a['pivot']:.2f} (מרחק: {a['dist_to_pivot'] * 100:.1f}%)\n💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f}\n🔗 <a href='{tv_link}'>גרף ב-TradingView</a>\n────────────────\n"
+                log_signal(a["ticker"], a["close"], a["status"])
+                
+        if final_bench:
+            msg += f"🪑 <b>משלימות מהספסל (למעקב רחוק): ({len(final_bench)})</b>\n\n"
+            for a in final_bench:
+                tv_link = f"https://il.tradingview.com/chart/?symbol={a['ticker']}"
+                warn = " ⚠️ (שיקום)" if a["is_below_150"] else ""
+                msg += f"🪑 <b>{a['ticker']}</b> | VCP {warn}\n⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}%\n📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}%\n🎯 <b>פיבוט יעד:</b> ${a['pivot']:.2f} (מרחק: {a['dist_to_pivot'] * 100:.1f}%)\n💵 <b>מחיר:</b> ${a['close']:.2f}\n🔗 <a href='{tv_link}'>גרף ב-TradingView</a>\n────────────────\n"
                 log_signal(a["ticker"], a["close"], a["status"])
 
         send_telegram(msg)
