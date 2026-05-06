@@ -19,101 +19,114 @@ CUSTOM_TICKERS_FILE = "mystock.csv"
 # סינוני בסיס
 MIN_PRICE = 10.0
 MIN_MARKET_CAP = 2_000_000_000   # 1 מיליארד דולר
-MIN_DOLLAR_VOL = 30_000_000      # 10 מיליון דולר ביום
+MIN_DOLLAR_VOL = 20_000_000      # 10 מיליון דולר ביום
 COOLDOWN_DAYS = 5                # מניעת ספאם
 
 # ==========================================
-# 2. מנוע VCP (התנגדות אופקית מרובת נגיעות)
+# 2. מנוע ה-VCP (זיהוי התנגדות אופקית מבוססת זמן)
 # ==========================================
-def detect_horizontal_vcp(df, is_turnaround=False):
+def detect_time_spaced_vcp(df, is_turnaround=False):
     """
-    סורק כשנה וחצי אחורה (350 ימים) כדי למצוא קו התנגדות אופקי וברור 
-    שנבדק לפחות פעמיים (עדיף יותר), ולאחריו נוצרה התכווצות (ידית).
+    מנוע חכם שמחפש בסיסים ארוכים ושטוחים.
+    חובה למצוא לפחות 2 שיאים באותו מחיר, המרוחקים לפחות 3 שבועות זה מזה.
     """
-    window = df.tail(350)
-    if len(window) < 150:
+    window = df.tail(250) # בודק שנה אחורה
+    if len(window) < 100:
         return None
 
     highs = window['High'].values
     lows = window['Low'].values
     closes = window['Close'].values
 
-    # 1. מציאת כל השיאים המקומיים (חלון של 10 ימים לכל כיוון)
+    # 1. מציאת כל השיאים המקומיים
     peaks = []
-    for i in range(10, len(highs) - 10):
-        if highs[i] == np.max(highs[i-10:i+11]):
+    for i in range(5, len(highs) - 5):
+        if highs[i] == np.max(highs[i-5:i+6]):
             peaks.append((i, highs[i]))
 
     if len(peaks) < 2:
         return None
 
-    # 2. איתור קו ההתנגדות החזק ביותר (חייב להכיל לפחות 2 נגיעות מקבילות)
-    best_group = []
-    best_pivot = 0.0
+    best_pattern = None
+    max_touches = 0
 
+    # 2. חיפוש תקרת בטון (התנגדות)
     for i, (p_idx, p_val) in enumerate(peaks):
-        # מקבץ את כל השיאים שנמצאים ברצועה צרה של 3% מנקודה זו (Flat Top)
-        group = [idx for idx, val in peaks if abs(val - p_val) / p_val <= 0.03]
+        # מתחילים קבוצת נגיעות עם השיא הנוכחי
+        valid_touches = [(p_idx, p_val)]
         
-        # מחפש את הרצועה עם הכי הרבה נגיעות, שובר שוויון לפי המחיר הגבוה
-        if len(group) >= 2: # 🚨 חוק ברזל: חייבים לפחות 2 שיאים מקבילים!
-            if len(group) > len(best_group) or (len(group) == len(best_group) and p_val > best_pivot):
-                best_group = group
-                best_pivot = np.max([highs[idx] for idx in group])
+        for j, (other_idx, other_val) in enumerate(peaks):
+            if i == j: continue
+            
+            # אם השיא האחר נמצא באזור של 3% מנקודת הפיבוט שלנו
+            if abs(other_val - p_val) / p_val <= 0.03:
+                # 🚨 חוק המרחק (Time Spacing): מוודא שהשיא האחר רחוק לפחות 15 ימי מסחר מכל שיא אחר בקבוצה
+                is_spaced = all(abs(other_idx - v_idx) >= 15 for v_idx, v_val in valid_touches)
+                if is_spaced:
+                    valid_touches.append((other_idx, other_val))
 
-    # אם לא מצאנו קו התנגדות אופקי עם לפחות 2 שיאים - אין כאן תבנית.
-    if len(best_group) < 2:
-        return None
+        valid_touches.sort(key=lambda x: x[0]) # מסדר כרונולוגית
 
-    first_touch_idx = best_group[0]
-    last_touch_idx = best_group[-1]
+        # חייבים לפחות 2 נגיעות מרוחקות בזמן (מחסל מניות כמו CW)
+        if len(valid_touches) >= 2:
+            first_touch_idx = valid_touches[0][0]
+            last_touch_idx = valid_touches[-1][0]
 
-    # זמן התבססות: חייב להיות לפחות 30 ימי מסחר בין הנגיעה הראשונה לאחרונה
-    if last_touch_idx - first_touch_idx < 30:
-        return None
+            # 🚨 חוק אורך הבסיס: המרחק בין הנגיעה הראשונה לאחרונה חייב להיות לפחות חודשיים (40 ימי מסחר)
+            base_duration = last_touch_idx - first_touch_idx
+            if base_duration < 40:
+                continue
 
-    # 3. מדידת עומק הבסיס (השפל הכי נמוך מאז הנגיעה הראשונה)
-    base_low = np.min(lows[first_touch_idx:])
-    base_depth = (best_pivot - base_low) / best_pivot
+            # הפיבוט האמיתי הוא המחיר הגבוה ביותר מבין הנגיעות שנבחרו
+            pivot = np.max([val for idx, val in valid_touches])
 
-    max_allowed_depth = 0.70 if is_turnaround else 0.45
-    if base_depth < 0.10 or base_depth > max_allowed_depth:
-        return None
+            # עומק הבסיס הכולל (ההתרסקות הגדולה ביותר מאז הנגיעה הראשונה)
+            base_low = np.min(lows[first_touch_idx:])
+            base_depth = (pivot - base_low) / pivot
 
-    # 4. מדידת התכווצות (הידית) - מחושבת מהשפל מאז הנגיעה *האחרונה* בתקרה
-    # נוודא קודם שעברו לפחות 3 ימים מהנגיעה האחרונה, כדי שהידית תספיק להיווצר
-    if len(lows) - last_touch_idx < 3:
-        return None
+            max_allowed_depth = 0.70 if is_turnaround else 0.45
+            if base_depth < 0.10 or base_depth > max_allowed_depth:
+                continue
 
-    handle_low = np.min(lows[last_touch_idx:])
-    handle_depth = (best_pivot - handle_low) / best_pivot
+            # אם לא עברו לפחות 3 ימים מהנגיעה האחרונה, אין לידית זמן להיווצר
+            if len(lows) - last_touch_idx < 3:
+                continue
 
-    # 🚨 חוקי הברזל של מינרוויני לכיווץ ימני 🚨
-    # א. שפלים עולים: הירידה האחרונה חייבת להיות קטנה משמעותית מההתרסקות הגדולה (חצי לפחות)
-    if handle_depth > (base_depth * 0.55):
-        return None
-    
-    # ב. תקרת זכוכית לכיווץ: הידית ממש לקראת פריצה לא יכולה להיות עמוקה מ-12% (או 15% בשיקום)
-    max_handle = 0.15 if is_turnaround else 0.12
-    if handle_depth > max_handle:
-        return None
+            # מדידת הכיווץ (הידית) האחרון
+            handle_low = np.min(lows[last_touch_idx:])
+            tightness = (pivot - handle_low) / pivot
 
-    # 5. סטטוס נוכחי (האם אנחנו קרובים לקו ההתנגדות הזה עכשיו?)
-    current_price = closes[-1]
-    dist_to_pivot = (current_price / best_pivot) - 1.0
+            # 🚨 חוק התכווצות: הידית חייבת להיות קטנה בחצי מעומק הבסיס המקורי
+            if tightness > base_depth * 0.55:
+                continue
+            
+            # עומק מקסימלי לידית 12% (או 15% לשיקום)
+            max_handle = 0.15 if is_turnaround else 0.12
+            if tightness > max_handle:
+                continue
 
-    # אם אנחנו רחוקים מ-6% למטה, זה עוד לא הזמן. אם פרצנו מעל 3.5%, כבר ברח.
-    if dist_to_pivot < -0.06 or dist_to_pivot > 0.035:
-        return None
+            # קרבה לפיבוט (סטטוס כניסה)
+            current_price = closes[-1]
+            dist_to_pivot = (current_price / pivot) - 1.0
 
-    return {
-        "pivot_price": best_pivot,
-        "tight_low": handle_low,
-        "tightness_pct": handle_depth * 100,
-        "base_depth_pct": base_depth * 100,
-        "dist_to_pivot": dist_to_pivot * 100,
-        "touches": len(best_group)
-    }
+            # מאפשר קנייה גם אם ברח עד 5.5% מעל הפיבוט (כדי לא לפספס את FTNT)
+            if dist_to_pivot < -0.06 or dist_to_pivot > 0.055:
+                continue
+
+            # מעדכן את התבנית הטובה ביותר (זו עם הכי הרבה נגיעות)
+            if len(valid_touches) > max_touches:
+                max_touches = len(valid_touches)
+                best_pattern = {
+                    "pivot_price": pivot,
+                    "tight_low": handle_low,
+                    "tightness_pct": tightness * 100,
+                    "base_depth_pct": base_depth * 100,
+                    "dist_to_pivot": dist_to_pivot * 100,
+                    "touches": len(valid_touches),
+                    "duration_days": base_duration
+                }
+
+    return best_pattern
 
 # ==========================================
 # 3. מתנדים, נתונים ופילטר שוק
@@ -173,7 +186,7 @@ def load_tickers():
                 tickers = [t.replace('.', '-') for t in tickers if t.isalpha() or '-' in t or '.' in t]
                 return sorted(list(set(tickers)))
         except: pass
-    return ['AAPL', 'MSFT', 'NVDA', 'META', 'AMZN'] 
+    return ['AAPL', 'MSFT', 'NVDA', 'META', 'AMZN', 'FTNT', 'HUN'] 
 
 # ==========================================
 # 4. מערכת תקשורת וזיכרון (למניעת ספאם)
@@ -223,7 +236,7 @@ def scan_market():
     tickers = load_tickers()
     if not tickers: return
     
-    print("📥 מתחיל סריקה... (מחפש התנגדויות אופקיות של שנתיים אחורה)")
+    print("📥 מתחיל סריקה עמוקה... (מחפש בסיסים ארוכים עם נגיעות מרוחקות)")
     market_ok, spy_rs = get_spy_trend()
     
     market_warning = "" if market_ok else "⚠️ <b>השוק חלש (SPY מתחת ל-200). סוחר בזהירות.</b>\n\n"
@@ -232,9 +245,8 @@ def scan_market():
     for ticker in tickers:
         print(f"בודק את {ticker}...", end="\r")
         try:
-            # 🚨 מוריד עכשיו שנתיים שלמות כדי לתפוס בסיסים ענקיים
-            df = yf.download(ticker, period="2y", auto_adjust=True, progress=False)
-            if len(df) < 250: continue
+            df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
+            if len(df) < 200: continue
             
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
@@ -257,8 +269,8 @@ def scan_market():
             else:
                 if (float(today["ROC_65"]) - spy_rs) < 0.02: continue
             
-            # --- המבחן הגדול: ה-VCP מרובה הנגיעות ---
-            vcp = detect_horizontal_vcp(df, is_turnaround)
+            # --- הפעלת ה-VCP Engine החכם ---
+            vcp = detect_time_spaced_vcp(df, is_turnaround)
             if not vcp: continue
             
             if should_skip_spam(ticker): continue
@@ -293,6 +305,7 @@ def scan_market():
                 "base_depth": vcp["base_depth_pct"],
                 "tightness": vcp["tightness_pct"],
                 "touches": vcp["touches"],
+                "duration": vcp["duration_days"],
                 "vol_ratio": vol_ratio,
                 "rs": (float(today["ROC_65"]) - spy_rs) * 100,
                 "stop_loss": stop_loss,
@@ -308,12 +321,12 @@ def scan_market():
     # 6. יצירת הדוח לטלגרם
     # ==========================================
     if not results:
-        send_telegram("✅ הסריקה הסתיימה. הוסרו תעלות עולות! לא נמצאו מניות עם בסיס אופקי מוצק כרגע.")
+        send_telegram("✅ הסריקה הסתיימה. נחסמו תעלות עולות. לא נמצאו מניות עם בסיס אופקי ארוך כרגע.")
         return
 
     results.sort(key=lambda x: abs(x["dist"]))
     
-    msg = f"🎯 <b>סריקת VCP (בסיסים אופקיים בלבד) הסתיימה!</b>\n{market_warning}נמצאו {len(results)} סטאפים מובחרים:\n\n"
+    msg = f"🎯 <b>סריקת VCP (בסיסים ארוכים ושטוחים) הסתיימה!</b>\n{market_warning}נמצאו {len(results)} סטאפים מובחרים:\n\n"
     
     for r in results[:10]:
         icon = "🚀" if "פריצה" in r["status"] else "⏳"
@@ -321,11 +334,12 @@ def scan_market():
         tv_link = f"https://il.tradingview.com/chart/?symbol={r['ticker']}"
         
         msg += f"{icon} <b>{r['ticker']}</b> | {r['status']}{warn}\n"
-        msg += f"📐 <b>מבנה ({r['touches']} נגיעות בתקרה):</b> בסיס {r['base_depth']:.1f}% ⬅️ התכווצות {r['tightness']:.1f}%\n"
+        msg += f"📐 <b>מבנה:</b> {r['touches']} נגיעות בתקרה | אורך בסיס: {r['duration']} ימי מסחר\n"
+        msg += f"📊 <b>עומק:</b> בסיס {r['base_depth']:.1f}% ⬅️ כיווץ ימני {r['tightness']:.1f}%\n"
         msg += f"📈 <b>עוצמה:</b> {r['rs']:.1f}% | 📊 <b>ווליום:</b> {r['vol_ratio']:.1f}x\n"
         
         if "פריצה" in r["status"]:
-            msg += f"🎯 <b>נפרץ קו ההתנגדות:</b> ${r['pivot']:.2f} | 💵 <b>מחיר:</b> ${r['close']:.2f}\n"
+            msg += f"🎯 <b>נפרץ קו התנגדות:</b> ${r['pivot']:.2f} | 💵 <b>מחיר:</b> ${r['close']:.2f}\n"
         else:
             msg += f"🎯 <b>פיבוט התנגדות:</b> ${r['pivot']:.2f} (מרחק: {r['dist']:.1f}%) | 💵 <b>מחיר:</b> ${r['close']:.2f}\n"
             
