@@ -29,8 +29,8 @@ market_cap_cache = {}
 
 def load_brain():
     brain = {
-        "max_base_depth": 0.65,               # הורחב כדי לתפוס גם התאוששויות עמוקות (Turnarounds כמו HUN)
-        "max_tightness_depth": 0.15,          # הורחב כדי לאפשר כיווץ הגיוני לשוק הנוכחי
+        "max_base_depth": 0.65,               
+        "max_tightness_depth": 0.15,          
         "min_breakout_close_strength": 0.55,
         "min_rs_65": 0.03,
         "max_dist_from_52w_high_normal": 0.18,
@@ -42,7 +42,7 @@ def load_brain():
         "min_contractions": 2,
         "max_contractions": 4,
         "pivot_tolerance": 0.03,
-        "min_base_length": 40,                # 🚨 תוקן! בסיס חייב להיות לפחות חודשיים (פסילת מיקרו-תבניות כמו FTS)
+        "min_base_length": 40,                
         "max_base_length": 200,
         "max_dry_up_ratio": 0.78,
         "atr_contraction_ratio": 0.95,
@@ -221,7 +221,6 @@ def normalize_ohlcv_columns(df):
 def add_indicators(df):
     df = normalize_ohlcv_columns(df)
 
-    # הוספת min_periods פותרת את בעיית הקריסה בשלב 1
     df["SMA_21"] = df["Close"].rolling(21, min_periods=10).mean()
     df["SMA_50"] = df["Close"].rolling(50, min_periods=25).mean()
     df["SMA_150"] = df["Close"].rolling(150, min_periods=75).mean()
@@ -309,7 +308,6 @@ def check_market_cap(ticker):
 
     try:
         t = yf.Ticker(ticker)
-
         try:
             fi = t.fast_info
             if fi:
@@ -331,7 +329,7 @@ def check_market_cap(ticker):
 
 
 # ==========================================
-# 5. Swing points ו-detectors מותאמים חומרה 🚨
+# 5. מנוע זיהוי תבניות VCP קשוח
 # ==========================================
 def find_swing_highs(arr, window=4):
     arr = np.asarray(arr, dtype=float)
@@ -348,21 +346,6 @@ def find_swing_highs(arr, window=4):
     return peaks
 
 
-def find_swing_lows(arr, window=4):
-    arr = np.asarray(arr, dtype=float)
-    lows = []
-
-    for i in range(window, len(arr) - window):
-        segment = arr[i - window:i + window + 1]
-        if not np.all(np.isfinite(segment)):
-            continue
-
-        if arr[i] == np.min(segment) and arr[i] < arr[i - 1] and arr[i] <= arr[i + 1]:
-            lows.append(i)
-
-    return lows
-
-
 def dedupe_indices(indices, values, min_sep=25, keep_higher=True):
     if not indices:
         return []
@@ -372,7 +355,6 @@ def dedupe_indices(indices, values, min_sep=25, keep_higher=True):
 
     for idx in indices[1:]:
         last = kept[-1]
-        # 🚨 חוק מרחק: חייבים להיות במרחק של לפחות חודש אחד מהשני
         if idx - last >= min_sep:
             kept.append(idx)
         else:
@@ -385,7 +367,7 @@ def dedupe_indices(indices, values, min_sep=25, keep_higher=True):
 
 
 def get_vcp_signal(hist):
-    recent = hist.tail(250).copy() # מסתכל 250 ימים (שנה) אחורה כדי לתפוס תבניות כמו FTNT
+    recent = hist.tail(250).copy() 
     if len(recent) < 80:
         return None
 
@@ -411,7 +393,7 @@ def get_vcp_signal(hist):
         raw_hits = np.where(highs[:-3] >= pivot * (1 - BRAIN["pivot_tolerance"]))[0].tolist()
         touch_candidates = raw_hits
 
-    # 🚨 חוק מרחק בזמן: מינימום 25 ימי מסחר (יותר מחודש) בין נגיעה לנגיעה! (מחסל מניות רועשות)
+    # מינימום 25 ימי מסחר בין נגיעה לנגיעה בתקרת ההתנגדות
     touches = dedupe_indices(touch_candidates, highs, min_sep=25, keep_higher=True)
 
     if len(touches) < BRAIN["min_touch_count"]:
@@ -425,8 +407,7 @@ def get_vcp_signal(hist):
     base_end = n - 1
     base_len = base_end - base_start + 1
 
-    # 🚨 חוק אורך בסיס: תבנית חייבת להתבשל לפחות חודשיים-שלושה.
-    if base_len < BRAIN["min_base_length"]:
+    if base_len < BRAIN["min_base_length"] or base_len > (BRAIN["max_base_length"] + 25):
         return None
 
     depths = []
@@ -444,7 +425,7 @@ def get_vcp_signal(hist):
     if len(depths) < BRAIN["min_contractions"]:
         return None
 
-    # 🚨 חוק עומק מינימלי: מסנן ירידות זעירות של 4%-6% כמו שראינו ב-FTS. חייב לרדת לפחות 10% לניעור.
+    # חוק ברזל נגד פולבאקים רדודים (כמו FTS): חייבת להיות התרסקות של 10% לפחות בין הנגיעות
     if max(depths) < 0.10:
         return None
 
@@ -454,11 +435,14 @@ def get_vcp_signal(hist):
     if depths[-1] > BRAIN["max_tightness_depth"]:
         return None
 
-    # 🚨 התכווצות: התיקון האחרון (ידית) חייב להיות קטן בחצי מההתרסקות המקסימלית (מקסימום 55% מעומק הבסיס)
+    decreasing_steps = sum(depths[i + 1] <= depths[i] * 1.15 for i in range(len(depths) - 1))
+    if decreasing_steps < len(depths) - 1:
+        return None
+
+    # התכווצות: התיקון האחרון בידית חייב להיות קטן בחצי מההתרסקות המקסימלית של הבסיס
     if depths[-1] > max(depths) * 0.55:
         return None
 
-    # שפלים עולים (בסלחנות כדי לאפשר Shakeout קל)
     low_prices = [x[1] for x in pullback_lows]
     if len(low_prices) >= 2 and low_prices[-1] < low_prices[0] * 0.95:
         return None
@@ -480,13 +464,6 @@ def get_vcp_signal(hist):
     if dry_up_ratio > BRAIN["max_dry_up_ratio"]:
         return None
 
-    early_atr = early_slice["ATR_Pct"].mean()
-    late_atr = late_slice["ATR_Pct"].mean()
-    atr_ratio = float(late_atr / early_atr) if early_atr and np.isfinite(early_atr) else 1.0
-
-    if np.isfinite(atr_ratio) and atr_ratio > 1.05:
-        return None
-
     last_touch = touches[-1]
     tight_zone_start = max(0, last_touch - 12)
     tight_low = float(np.min(lows[tight_zone_start:]))
@@ -501,7 +478,6 @@ def get_vcp_signal(hist):
         "tightness": depths[-1],
         "base_depth": max(depths),
         "dry_up_ratio": dry_up_ratio,
-        "atr_ratio": atr_ratio,
         "touches": len(touches),
         "contractions": len(depths),
         "contraction_text": pullback_text,
@@ -509,54 +485,7 @@ def get_vcp_signal(hist):
         "type": "VCP"
     }
 
-
-def get_flat_base_signal(hist):
-    recent = hist.tail(120).copy() # מסתכל חצי שנה אחורה
-    if len(recent) < 45: # 🚨 בסיס שטוח חייב להיות לפחות 45 ימי מסחר
-        return None
-
-    highs = recent["High"].astype(float)
-    lows = recent["Low"].astype(float)
-    closes = recent["Close"].astype(float)
-
-    pivot = float(highs.iloc[:-3].max())
-    low = float(lows.min())
-    depth = (pivot - low) / pivot if pivot > 0 else 999
-
-    # 🚨 עומק בסיס שטוח חייב להיות לפחות 10% כדי להעיף מניות רועשות
-    if not (0.10 <= depth <= 0.25):
-        return None
-
-    last_15 = recent.tail(15)
-    close_std_pct = float(last_15["Close"].std() / last_15["Close"].mean())
-    if not np.isfinite(close_std_pct) or close_std_pct > 0.03:
-        return None
-
-    early_vol = float(recent["Volume"].head(20).mean())
-    late_vol = float(recent["Volume"].tail(10).mean())
-    dry_up_ratio = late_vol / early_vol if early_vol > 0 else 1.0
-
-    if not np.isfinite(dry_up_ratio) or dry_up_ratio > 0.80:
-        return None
-
-    tight_low = float(last_15["Low"].min())
-    atr_ratio = float(last_15["ATR_Pct"].mean() / recent["ATR_Pct"].head(20).mean()) if recent["ATR_Pct"].head(20).mean() > 0 else 1.0
-
-    return {
-        "pivot_price": pivot,
-        "tight_low": tight_low,
-        "last_pullback_low": tight_low,
-        "tightness": (pivot - tight_low) / pivot,
-        "base_depth": depth,
-        "dry_up_ratio": dry_up_ratio,
-        "atr_ratio": atr_ratio,
-        "touches": 2,
-        "contractions": 1,
-        "contraction_text": f"{depth*100:.1f}%",
-        "base_length": len(recent),
-        "type": "Flat Base"
-    }
-
+# הפונקציה הישנה והטיפשה נמחקה לחלוטין מכאן!
 
 # ==========================================
 # 6. דירוג setup
@@ -686,9 +615,8 @@ def scan_market():
                 
             stats["pass_market_cap"] += 1
 
+            # הפונקציה הישנה והרועשת של Flat Base הוסרה לחלוטין מכאן
             pattern = get_vcp_signal(past_data)
-            if not pattern:
-                pattern = get_flat_base_signal(past_data)
             if not pattern:
                 continue
                 
@@ -789,7 +717,7 @@ def scan_market():
     print(f"עברו מרחק משיא שנתי (52w): {stats['pass_52w']}")
     print(f"עברו כוח יחסי (RS): {stats['pass_rs']}")
     print(f"עברו שווי שוק: {stats['pass_market_cap']}")
-    print(f"✅ עברו זיהוי תבנית VCP/Flat Base: {stats['pass_pattern']}")
+    print(f"✅ עברו זיהוי תבנית VCP קשוחה: {stats['pass_pattern']}")
     print(f"🎯 קרובים לפיבוט (בחלון כניסה): {stats['pass_pivot_dist']}")
     print(f"🏆 אושרו סופית (לאחר ספאם, סיכון וכו'): {stats['final_approved']}")
     print("=" * 50)
