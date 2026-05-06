@@ -37,7 +37,7 @@ def load_brain():
         "max_dist_from_52w_high_normal": 0.18,
         "max_dist_from_52w_high_below_150": 0.35,
         "max_gap_above_pivot": 0.02,
-        "max_entry_extension": 0.025,
+        "max_entry_extension": 0.04,          
         "breakout_volume_ratio": 1.4,
         "watchlist_volume_ratio": 0.75,
         "min_contractions": 2,
@@ -47,7 +47,7 @@ def load_brain():
         "max_base_length": 120,
         "max_dry_up_ratio": 0.78,
         "atr_contraction_ratio": 0.95,
-        "watchlist_max_dist": 0.03,
+        "watchlist_max_dist": 0.06,           
         "min_touch_count": 2,
         "max_risk_pct": 12.0,
         "allow_unknown_market_cap": True,
@@ -455,11 +455,11 @@ def get_vcp_signal(hist):
     if decreasing_steps < len(depths) - 1:
         return None
 
-    if depths[-1] >= depths[0]:
+    if depths[-1] >= depths[0] * 1.15:
         return None
 
     low_prices = [x[1] for x in pullback_lows]
-    if len(low_prices) >= 2 and low_prices[-1] <= low_prices[0] * 1.01:
+    if len(low_prices) >= 2 and low_prices[-1] < low_prices[0] * 0.98:
         return None
 
     base_df = recent.iloc[base_start:base_end + 1].copy()
@@ -597,8 +597,23 @@ def scan_market():
             market_warning = "⚠️ <b>שים לב: השוק הכללי לא במצב אידיאלי לפריצות.</b> הסריקה ממשיכה, אך הסיכון לפריצות שווא גבוה.\n\n"
 
     all_potentials = []
+    waiting_for_pivot_tickers = [] # רשימת ה"ספסל" למניות שלפני שלב הפיבוט
+
+    stats = {
+        "total_scanned": 0,
+        "pass_basic_data": 0,
+        "pass_price_vol": 0,
+        "pass_sma": 0,
+        "pass_52w": 0,
+        "pass_rs": 0,
+        "pass_market_cap": 0,
+        "pass_pattern": 0,
+        "pass_pivot_dist": 0,
+        "final_approved": 0
+    }
 
     for ticker in tickers:
+        stats["total_scanned"] += 1
         print(f"סורק את {ticker}...", end="\r")
 
         try:
@@ -616,6 +631,8 @@ def scan_market():
             required_cols = ["SMA_50", "SMA_150", "SMA_200", "ATR_14", "Vol_50", "High_252", "ROC_65"]
             if any(pd.isna(today[c]) for c in required_cols):
                 continue
+            
+            stats["pass_basic_data"] += 1
 
             close = float(today["Close"])
             open_price = float(today["Open"])
@@ -624,6 +641,8 @@ def scan_market():
 
             if close < MIN_PRICE or dollar_vol_50 < MIN_DOLLAR_VOL_50:
                 continue
+                
+            stats["pass_price_vol"] += 1
 
             if close <= float(today["SMA_50"]):
                 continue
@@ -636,6 +655,8 @@ def scan_market():
             else:
                 if float(today["SMA_50"]) <= float(yesterday["SMA_50"]):
                     continue
+                    
+            stats["pass_sma"] += 1
 
             dist_52w = (close / high_252) - 1.0
             max_dist = (
@@ -645,23 +666,31 @@ def scan_market():
             )
             if dist_52w < -max_dist:
                 continue
+                
+            stats["pass_52w"] += 1
 
             stock_rs = float(today["ROC_65"]) - float(spy_rs)
             required_rs = BRAIN["min_rs_65"] * (2 if is_below_150 else 1)
             if stock_rs < required_rs:
                 continue
+                
+            stats["pass_rs"] += 1
 
             market_cap = check_market_cap(ticker)
             if market_cap is not None and market_cap < MIN_MARKET_CAP:
                 continue
             if market_cap is None and not BRAIN["allow_unknown_market_cap"]:
                 continue
+                
+            stats["pass_market_cap"] += 1
 
             pattern = get_vcp_signal(past_data)
             if not pattern:
                 pattern = get_flat_base_signal(past_data)
             if not pattern:
                 continue
+                
+            stats["pass_pattern"] += 1
 
             pivot = float(pattern["pivot_price"])
             dist_to_pivot = (close / pivot) - 1.0
@@ -669,8 +698,12 @@ def scan_market():
             is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
             is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
 
+            # --- הוספת מניות לספסל אם הן לא בטווח הפיבוט ---
             if not (is_breakout or is_near_breakout):
+                waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
                 continue
+                
+            stats["pass_pivot_dist"] += 1
 
             if should_skip_spam(ticker, is_breakout):
                 continue
@@ -738,6 +771,8 @@ def scan_market():
 
             alert_data["setup_score"] = calc_setup_score(alert_data)
             all_potentials.append(alert_data)
+            
+            stats["final_approved"] += 1
 
         except Exception:
             pass
@@ -745,6 +780,26 @@ def scan_market():
         time.sleep(0.15)
 
     print("\n" + "=" * 50)
+    print("📊 סטטיסטיקת משפך סינון (Funnel Stats):")
+    print(f"סה\"כ נסרקו: {stats['total_scanned']}")
+    print(f"עברו נתונים בסיסיים: {stats['pass_basic_data']}")
+    print(f"עברו מחיר וווליום דולרי: {stats['pass_price_vol']}")
+    print(f"עברו ממוצעים נעים (SMA): {stats['pass_sma']}")
+    print(f"עברו מרחק משיא שנתי (52w): {stats['pass_52w']}")
+    print(f"עברו כוח יחסי (RS): {stats['pass_rs']}")
+    print(f"עברו שווי שוק: {stats['pass_market_cap']}")
+    print(f"✅ עברו זיהוי תבנית VCP/Flat Base: {stats['pass_pattern']}")
+    print(f"🎯 קרובים לפיבוט (בחלון כניסה): {stats['pass_pivot_dist']}")
+    print(f"🏆 אושרו סופית (לאחר ספאם, סיכון וכו'): {stats['final_approved']}")
+    print("=" * 50)
+    
+    # הדפסת ה"ספסל" במסך של גיטהאב
+    print("\n👀 מניות שעברו זיהוי תבנית תקינה אך עדיין רחוקות מהפיבוט (שלב לפני אחרון):")
+    if waiting_for_pivot_tickers:
+        print(", ".join(waiting_for_pivot_tickers))
+    else:
+        print("אין מניות כאלו כרגע.")
+    print("=" * 50)
 
     # מיון לפי ציון setup ואז לפי קרבה לפיבוט
     all_potentials_sorted = sorted(
