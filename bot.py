@@ -1,355 +1,872 @@
+# -*- coding: utf-8 -*-
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
 import time
 import os
-import warnings
+import json
 from datetime import datetime
+import warnings
 
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. הגדרות בסיסיות
+# 1. הגדרות כלליות
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
 CUSTOM_TICKERS_FILE = "mystock.csv"
 
-# סינוני בסיס
-MIN_PRICE = 10.0
-MIN_MARKET_CAP = 2_000_000_000   # 1 מיליארד דולר
-MIN_DOLLAR_VOL = 20_000_000      # 10 מיליון דולר ביום
-COOLDOWN_DAYS = 5                # מניעת ספאם
+MIN_MARKET_CAP = 2_000_000_000
+MIN_DOLLAR_VOL_50 = 20_000_000
+MIN_PRICE = 12.0
+COOLDOWN_DAYS = 5
+TOP_RESULTS = 10
+SCAN_PERIOD = "1y"
 
-# ==========================================
-# 2. מנוע ה-VCP (זיהוי התנגדות אופקית מבוססת זמן)
-# ==========================================
-def detect_time_spaced_vcp(df, is_turnaround=False):
-    """
-    מנוע חכם שמחפש בסיסים ארוכים ושטוחים.
-    חובה למצוא לפחות 2 שיאים באותו מחיר, המרוחקים לפחות 3 שבועות זה מזה.
-    """
-    window = df.tail(250) # בודק שנה אחורה
-    if len(window) < 100:
-        return None
+market_cap_cache = {}
 
-    highs = window['High'].values
-    lows = window['Low'].values
-    closes = window['Close'].values
 
-    # 1. מציאת כל השיאים המקומיים
-    peaks = []
-    for i in range(5, len(highs) - 5):
-        if highs[i] == np.max(highs[i-5:i+6]):
-            peaks.append((i, highs[i]))
+def load_brain():
+    brain = {
+        "max_base_depth": 0.32,
+        "max_tightness_depth": 0.08,
+        "min_breakout_close_strength": 0.55,
+        "min_rs_65": 0.03,
+        "max_dist_from_52w_high_normal": 0.18,
+        "max_dist_from_52w_high_below_150": 0.35,
+        "max_gap_above_pivot": 0.02,
+        "max_entry_extension": 0.025,
+        "breakout_volume_ratio": 1.4,
+        "watchlist_volume_ratio": 0.75,
+        "min_contractions": 2,
+        "max_contractions": 4,
+        "pivot_tolerance": 0.03,
+        "min_base_length": 25,
+        "max_base_length": 120,
+        "max_dry_up_ratio": 0.78,
+        "atr_contraction_ratio": 0.95,
+        "watchlist_max_dist": 0.03,
+        "min_touch_count": 2,
+        "max_risk_pct": 12.0,
+        "allow_unknown_market_cap": True,
+        "swing_window": 4,
+    }
 
-    if len(peaks) < 2:
-        return None
-
-    best_pattern = None
-    max_touches = 0
-
-    # 2. חיפוש תקרת בטון (התנגדות)
-    for i, (p_idx, p_val) in enumerate(peaks):
-        # מתחילים קבוצת נגיעות עם השיא הנוכחי
-        valid_touches = [(p_idx, p_val)]
-        
-        for j, (other_idx, other_val) in enumerate(peaks):
-            if i == j: continue
-            
-            # אם השיא האחר נמצא באזור של 3% מנקודת הפיבוט שלנו
-            if abs(other_val - p_val) / p_val <= 0.03:
-                # 🚨 חוק המרחק (Time Spacing): מוודא שהשיא האחר רחוק לפחות 15 ימי מסחר מכל שיא אחר בקבוצה
-                is_spaced = all(abs(other_idx - v_idx) >= 15 for v_idx, v_val in valid_touches)
-                if is_spaced:
-                    valid_touches.append((other_idx, other_val))
-
-        valid_touches.sort(key=lambda x: x[0]) # מסדר כרונולוגית
-
-        # חייבים לפחות 2 נגיעות מרוחקות בזמן (מחסל מניות כמו CW)
-        if len(valid_touches) >= 2:
-            first_touch_idx = valid_touches[0][0]
-            last_touch_idx = valid_touches[-1][0]
-
-            # 🚨 חוק אורך הבסיס: המרחק בין הנגיעה הראשונה לאחרונה חייב להיות לפחות חודשיים (40 ימי מסחר)
-            base_duration = last_touch_idx - first_touch_idx
-            if base_duration < 40:
-                continue
-
-            # הפיבוט האמיתי הוא המחיר הגבוה ביותר מבין הנגיעות שנבחרו
-            pivot = np.max([val for idx, val in valid_touches])
-
-            # עומק הבסיס הכולל (ההתרסקות הגדולה ביותר מאז הנגיעה הראשונה)
-            base_low = np.min(lows[first_touch_idx:])
-            base_depth = (pivot - base_low) / pivot
-
-            max_allowed_depth = 0.70 if is_turnaround else 0.45
-            if base_depth < 0.10 or base_depth > max_allowed_depth:
-                continue
-
-            # אם לא עברו לפחות 3 ימים מהנגיעה האחרונה, אין לידית זמן להיווצר
-            if len(lows) - last_touch_idx < 3:
-                continue
-
-            # מדידת הכיווץ (הידית) האחרון
-            handle_low = np.min(lows[last_touch_idx:])
-            tightness = (pivot - handle_low) / pivot
-
-            # 🚨 חוק התכווצות: הידית חייבת להיות קטנה בחצי מעומק הבסיס המקורי
-            if tightness > base_depth * 0.55:
-                continue
-            
-            # עומק מקסימלי לידית 12% (או 15% לשיקום)
-            max_handle = 0.15 if is_turnaround else 0.12
-            if tightness > max_handle:
-                continue
-
-            # קרבה לפיבוט (סטטוס כניסה)
-            current_price = closes[-1]
-            dist_to_pivot = (current_price / pivot) - 1.0
-
-            # מאפשר קנייה גם אם ברח עד 5.5% מעל הפיבוט (כדי לא לפספס את FTNT)
-            if dist_to_pivot < -0.06 or dist_to_pivot > 0.055:
-                continue
-
-            # מעדכן את התבנית הטובה ביותר (זו עם הכי הרבה נגיעות)
-            if len(valid_touches) > max_touches:
-                max_touches = len(valid_touches)
-                best_pattern = {
-                    "pivot_price": pivot,
-                    "tight_low": handle_low,
-                    "tightness_pct": tightness * 100,
-                    "base_depth_pct": base_depth * 100,
-                    "dist_to_pivot": dist_to_pivot * 100,
-                    "touches": len(valid_touches),
-                    "duration_days": base_duration
-                }
-
-    return best_pattern
-
-# ==========================================
-# 3. מתנדים, נתונים ופילטר שוק
-# ==========================================
-def add_indicators(df):
-    df["SMA_50"] = df["Close"].rolling(50).mean()
-    df["SMA_150"] = df["Close"].rolling(150).mean()
-    df["SMA_200"] = df["Close"].rolling(200).mean()
-    df["Vol_50"] = df["Volume"].rolling(50).mean()
-    df["DollarVol_50"] = df["Close"].rolling(50).mean() * df["Vol_50"]
-    df["ROC_65"] = df["Close"].pct_change(65)
-    df["High_252"] = df["High"].rolling(252).max()
-    
-    prev_close = df["Close"].shift(1)
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    df["ATR_14"] = tr.rolling(14).mean()
-    return df
-
-def get_spy_trend():
     try:
-        spy = yf.download("SPY", period="2y", auto_adjust=True, progress=False)
-        if isinstance(spy.columns, pd.MultiIndex):
-            spy.columns = spy.columns.get_level_values(0)
-        
-        spy["SMA_200"] = spy["Close"].rolling(200).mean()
-        spy["ROC_65"] = spy["Close"].pct_change(65)
-        
-        today = spy.iloc[-1]
-        sma_200_old = spy.iloc[-20]["SMA_200"]
-        
-        is_uptrend = (today["Close"] > today["SMA_200"]) and (today["SMA_200"] > sma_200_old)
-        return is_uptrend, float(today["ROC_65"])
-    except:
-        return True, 0.0 
+        if os.path.exists("brain.json"):
+            with open("brain.json", "r", encoding="utf-8") as f:
+                brain.update(json.load(f))
+    except Exception:
+        print("⚠️ אזהרה: לא ניתן לטעון את brain.json, משתמש בברירות מחדל.")
 
-def get_market_cap(ticker):
+    return brain
+
+
+BRAIN = load_brain()
+
+
+# ==========================================
+# 2. עזרי קבצים / טלגרם / אנטי-ספאם
+# ==========================================
+def append_dataframe(df, file_path):
     try:
-        t = yf.Ticker(ticker)
-        fast = getattr(t, 'fast_info', None)
-        if fast and getattr(fast, 'market_cap', None):
-            return float(fast.market_cap)
-        return float(t.info.get('marketCap', 0))
-    except:
-        return 0
+        if not os.path.isfile(file_path):
+            df.to_csv(file_path, index=False, encoding="utf-8-sig")
+        else:
+            df.to_csv(file_path, mode="a", header=False, index=False, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def send_telegram(message):
+    print("
+=== תוכן ההודעה המלאה ===")
+    print(message)
+    print("=========================
+")
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ מצב סימולציה - הטוקן או ה-ID חסרים ב-GitHub Secrets")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=12)
+        if response.status_code != 200:
+            print(f"❌ טלגרם חסם את ההודעה לקבוצה: {response.text}")
+        else:
+            print("✅ ההודעה נשלחה בהצלחה לקבוצת הטלגרם!")
+    except Exception as e:
+        print(f"❌ שגיאת תקשורת עם טלגרם: {e}")
+
+
+def log_signal(ticker, price, status):
+    log_file = "trading_log.csv"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    new_data = pd.DataFrame([{
+        "Date": now,
+        "Ticker": ticker,
+        "Price": round(float(price), 2),
+        "Status": status
+    }])
+
+    append_dataframe(new_data, log_file)
+
+
+def save_to_smart_memory(
+    ticker, price, stop_loss, risk_pct, vol_ratio, pivot, close_strength,
+    rs_65, tightness, pattern_type, status, setup_score, dry_up_ratio, touches
+):
+    memory_file = "smart_memory.csv"
+    now = datetime.now().strftime("%Y-%m-%d")
+
+    new_record = pd.DataFrame([{
+        "Date": now,
+        "Ticker": ticker,
+        "Price": round(float(price), 2),
+        "Pivot": round(float(pivot), 2),
+        "Stop_Loss": round(float(stop_loss), 2),
+        "Risk_Pct": round(float(risk_pct), 2),
+        "Volume_Ratio": round(float(vol_ratio), 2),
+        "Close_Strength": round(float(close_strength), 2),
+        "RS_65": round(float(rs_65), 4),
+        "Tightness_Pct": round(float(tightness) * 100, 2),
+        "Pattern_Type": pattern_type,
+        "Status": status,
+        "Setup_Score": round(float(setup_score), 1),
+        "DryUp_Ratio": round(float(dry_up_ratio), 2),
+        "Touches": int(touches)
+    }])
+
+    append_dataframe(new_record, memory_file)
+
+
+def should_skip_spam(ticker, is_breakout):
+    log_file = "trading_log.csv"
+    if not os.path.isfile(log_file):
+        return False
+
+    try:
+        df = pd.read_csv(log_file, encoding="utf-8-sig")
+        if df.empty:
+            return False
+
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+
+        ticker_history = df[df["Ticker"] == ticker].sort_values(by="Date", ascending=False)
+        if ticker_history.empty:
+            return False
+
+        last_sent = ticker_history.iloc[0]["Date"]
+
+        if is_breakout:
+            return last_sent.date() == datetime.now().date()
+
+        days_passed = (datetime.now() - last_sent).days
+        return days_passed < COOLDOWN_DAYS
+    except Exception:
+        return False
+
 
 def load_tickers():
     if os.path.exists(CUSTOM_TICKERS_FILE):
         try:
-            df = pd.read_csv(CUSTOM_TICKERS_FILE)
-            col_name = next((c for c in df.columns if c.strip().lower() in ['ticker', 'symbol']), None)
+            df = pd.read_csv(CUSTOM_TICKERS_FILE, encoding="utf-8-sig")
+            col_name = next((c for c in df.columns if c.strip().lower() in ["ticker", "symbol"]), None)
+
             if col_name:
-                tickers = df[col_name].dropna().astype(str).str.strip().str.upper().tolist()
-                tickers = [t.replace('.', '-') for t in tickers if t.isalpha() or '-' in t or '.' in t]
-                return sorted(list(set(tickers)))
-        except: pass
-    return ['AAPL', 'MSFT', 'NVDA', 'META', 'AMZN', 'FTNT', 'HUN'] 
+                tickers = (
+                    df[col_name]
+                    .dropna()
+                    .astype(str)
+                    .str.strip()
+                    .str.upper()
+                    .str.replace(".", "-", regex=False)
+                    .tolist()
+                )
+                tickers = [t for t in tickers if t and (t.replace("-", "").isalnum())]
+                tickers = sorted(list(set(tickers)))
+                print(f"✅ נטענו {len(tickers)} מניות מתוך {CUSTOM_TICKERS_FILE}")
+                return tickers
+        except Exception:
+            pass
+
+    return ["AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "META", "GOOGL", "PLTR"]
+
 
 # ==========================================
-# 4. מערכת תקשורת וזיכרון (למניעת ספאם)
+# 3. אינדיקטורים
 # ==========================================
-def should_skip_spam(ticker):
-    log_file = 'trading_log.csv'
-    if not os.path.isfile(log_file): return False
+def normalize_ohlcv_columns(df):
+    df = df.copy()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+
+    df = df[~df.index.duplicated(keep="first")]
+    return df
+
+
+def add_indicators(df):
+    df = normalize_ohlcv_columns(df)
+
+    df["SMA_21"] = df["Close"].rolling(21).mean()
+    df["SMA_50"] = df["Close"].rolling(50).mean()
+    df["SMA_150"] = df["Close"].rolling(150).mean()
+    df["SMA_200"] = df["Close"].rolling(200).mean()
+
+    df["Vol_10"] = df["Volume"].rolling(10).mean()
+    df["Vol_20"] = df["Volume"].rolling(20).mean()
+    df["Vol_50"] = df["Volume"].rolling(50).mean()
+    df["DollarVol_50"] = df["Close"].rolling(50).mean() * df["Vol_50"]
+
+    df["Prev_Close"] = df["Close"].shift(1)
+    df["ROC_65"] = df["Close"].pct_change(65)
+    df["High_252"] = df["High"].rolling(252).max()
+
+    tr = pd.concat(
+        [
+            df["High"] - df["Low"],
+            (df["High"] - df["Prev_Close"]).abs(),
+            (df["Low"] - df["Prev_Close"]).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    df["ATR_14"] = tr.rolling(14).mean()
+    df["ATR_Pct"] = df["ATR_14"] / df["Close"]
+    df["Range_Pct"] = (df["High"] - df["Low"]) / df["Close"]
+
+    return df
+
+
+def get_spy_data():
     try:
-        df = pd.read_csv(log_file)
-        df['Date'] = pd.to_datetime(df['Date'])
-        history = df[df['Ticker'] == ticker].sort_values(by='Date', ascending=False)
-        if history.empty: return False
-        
-        days_passed = (datetime.now() - history.iloc[0]['Date']).days
-        return days_passed < COOLDOWN_DAYS
-    except:
+        spy = yf.download("SPY", period=SCAN_PERIOD, auto_adjust=True, progress=False)
+        spy = normalize_ohlcv_columns(spy)
+
+        if not spy.empty and len(spy) > 200:
+            spy["SMA_50"] = spy["Close"].rolling(50).mean()
+            spy["SMA_150"] = spy["Close"].rolling(150).mean()
+            spy["SMA_200"] = spy["Close"].rolling(200).mean()
+            spy["ROC_65"] = spy["Close"].pct_change(65)
+            spy["ATR_14"] = pd.concat(
+                [
+                    spy["High"] - spy["Low"],
+                    (spy["High"] - spy["Close"].shift(1)).abs(),
+                    (spy["Low"] - spy["Close"].shift(1)).abs()
+                ],
+                axis=1
+            ).max(axis=1).rolling(14).mean()
+            spy["ATR_Pct"] = spy["ATR_14"] / spy["Close"]
+            return spy
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+def market_filter_ok(spy_df):
+    if spy_df.empty or len(spy_df) < 220:
         return False
 
-def log_sent_signal(ticker):
-    log_file = 'trading_log.csv'
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    new_data = pd.DataFrame([{'Date': now, 'Ticker': ticker}])
-    try:
-        if not os.path.isfile(log_file): new_data.to_csv(log_file, index=False)
-        else: new_data.to_csv(log_file, mode='a', header=False, index=False)
-    except: pass
+    today = spy_df.iloc[-1]
+    sma200_old = spy_df["SMA_200"].iloc[-20]
+    atr_pct = float(today["ATR_Pct"]) if pd.notna(today["ATR_Pct"]) else 0.0
 
-def send_telegram(message):
-    print("\n=== דוח סריקה ===")
-    print(message)
-    print("=================\n")
-    
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ לא הוגדרו טוקנים של טלגרם. הסריקה בוצעה במצב סימולציה (הדפסה למסך בלבד).")
-        return
-        
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except: pass
+    if pd.isna(today["SMA_200"]) or pd.isna(sma200_old):
+        return False
+
+    trend_ok = (
+        float(today["Close"]) > float(today["SMA_50"]) > float(today["SMA_150"]) > float(today["SMA_200"])
+        and float(today["SMA_200"]) > float(sma200_old)
+    )
+
+    volatility_ok = atr_pct < 0.03
+    return trend_ok and volatility_ok
+
 
 # ==========================================
-# 5. המוח: תהליך הסריקה הראשי
+# 4. בדיקות איכות יקום
+# ==========================================
+def check_market_cap(ticker):
+    if ticker in market_cap_cache:
+        return market_cap_cache[ticker]
+
+    market_cap = None
+
+    try:
+        t = yf.Ticker(ticker)
+
+        try:
+            fi = t.fast_info
+            if fi:
+                market_cap = fi.get("marketCap", None) or fi.get("market_cap", None)
+        except Exception:
+            pass
+
+        if not market_cap:
+            try:
+                info = t.info
+                market_cap = info.get("marketCap", None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    market_cap_cache[ticker] = market_cap
+    return market_cap
+
+
+# ==========================================
+# 5. Swing points ו-detectors
+# ==========================================
+def find_swing_highs(arr, window=4):
+    arr = np.asarray(arr, dtype=float)
+    peaks = []
+
+    for i in range(window, len(arr) - window):
+        segment = arr[i - window:i + window + 1]
+        if not np.all(np.isfinite(segment)):
+            continue
+
+        if arr[i] == np.max(segment) and arr[i] > arr[i - 1] and arr[i] >= arr[i + 1]:
+            peaks.append(i)
+
+    return peaks
+
+
+def find_swing_lows(arr, window=4):
+    arr = np.asarray(arr, dtype=float)
+    lows = []
+
+    for i in range(window, len(arr) - window):
+        segment = arr[i - window:i + window + 1]
+        if not np.all(np.isfinite(segment)):
+            continue
+
+        if arr[i] == np.min(segment) and arr[i] < arr[i - 1] and arr[i] <= arr[i + 1]:
+            lows.append(i)
+
+    return lows
+
+
+def dedupe_indices(indices, values, min_sep=6, keep_higher=True):
+    if not indices:
+        return []
+
+    indices = sorted(indices)
+    kept = [indices[0]]
+
+    for idx in indices[1:]:
+        last = kept[-1]
+        if idx - last >= min_sep:
+            kept.append(idx)
+        else:
+            if keep_higher and values[idx] > values[last]:
+                kept[-1] = idx
+            elif (not keep_higher) and values[idx] < values[last]:
+                kept[-1] = idx
+
+    return kept
+
+
+def get_vcp_signal(hist):
+    recent = hist.tail(180).copy()
+    if len(recent) < 80:
+        return None
+
+    highs = recent["High"].astype(float).values
+    lows = recent["Low"].astype(float).values
+    vols = recent["Volume"].astype(float).values
+    closes = recent["Close"].astype(float).values
+    atr_pct = recent["ATR_Pct"].astype(float).values
+    n = len(recent)
+
+    pivot = float(np.max(highs[:-5]))
+    if not np.isfinite(pivot) or pivot <= 0:
+        return None
+
+    swing_window = int(BRAIN["swing_window"])
+    swing_highs = find_swing_highs(highs, window=swing_window)
+
+    touch_candidates = [
+        i for i in swing_highs
+        if i < n - 3 and highs[i] >= pivot * (1 - BRAIN["pivot_tolerance"])
+    ]
+
+    if len(touch_candidates) < 2:
+        raw_hits = np.where(highs[:-3] >= pivot * (1 - BRAIN["pivot_tolerance"]))[0].tolist()
+        touch_candidates = raw_hits
+
+    touches = dedupe_indices(touch_candidates, highs, min_sep=6, keep_higher=True)
+
+    if len(touches) < BRAIN["min_touch_count"]:
+        return None
+
+    max_touches = int(BRAIN["max_contractions"]) + 1
+    if len(touches) > max_touches:
+        touches = touches[-max_touches:]
+
+    base_start = max(0, touches[0] - 10)
+    base_end = n - 1
+    base_len = base_end - base_start + 1
+
+    if base_len < BRAIN["min_base_length"] or base_len > (BRAIN["max_base_length"] + 25):
+        return None
+
+    depths = []
+    pullback_lows = []
+
+    for a, b in zip(touches[:-1], touches[1:]):
+        seg_low_idx_rel = int(np.argmin(lows[a:b + 1]))
+        seg_low_idx = a + seg_low_idx_rel
+        seg_low_price = float(lows[seg_low_idx])
+
+        depth = (pivot - seg_low_price) / pivot
+        depths.append(float(depth))
+        pullback_lows.append((seg_low_idx, seg_low_price))
+
+    if len(depths) < BRAIN["min_contractions"]:
+        return None
+
+    if len(depths) > BRAIN["max_contractions"]:
+        return None
+
+    if max(depths) > BRAIN["max_base_depth"]:
+        return None
+
+    if depths[-1] > BRAIN["max_tightness_depth"]:
+        return None
+
+    decreasing_steps = sum(depths[i + 1] <= depths[i] * 1.15 for i in range(len(depths) - 1))
+    if decreasing_steps < len(depths) - 1:
+        return None
+
+    if depths[-1] >= depths[0]:
+        return None
+
+    low_prices = [x[1] for x in pullback_lows]
+    if len(low_prices) >= 2 and low_prices[-1] <= low_prices[0] * 1.01:
+        return None
+
+    base_df = recent.iloc[base_start:base_end + 1].copy()
+    if len(base_df) < 20:
+        return None
+
+    early_slice = base_df.iloc[:max(10, len(base_df) // 3)]
+    late_slice = base_df.iloc[-10:]
+
+    early_vol = early_slice["Volume"].mean()
+    late_vol = late_slice["Volume"].mean()
+    dry_up_ratio = float(late_vol / early_vol) if early_vol and np.isfinite(early_vol) else 1.0
+
+    if not np.isfinite(dry_up_ratio):
+        dry_up_ratio = 1.0
+
+    if dry_up_ratio > BRAIN["max_dry_up_ratio"]:
+        return None
+
+    early_atr = early_slice["ATR_Pct"].mean()
+    late_atr = late_slice["ATR_Pct"].mean()
+    atr_ratio = float(late_atr / early_atr) if early_atr and np.isfinite(early_atr) else 1.0
+
+    if np.isfinite(atr_ratio) and atr_ratio > 1.05:
+        return None
+
+    last_touch = touches[-1]
+    tight_zone_start = max(0, last_touch - 12)
+    tight_low = float(np.min(lows[tight_zone_start:]))
+    last_pullback_low = float(pullback_lows[-1][1])
+
+    pullback_text = " > ".join(f"{d*100:.1f}%" for d in depths)
+
+    return {
+        "pivot_price": pivot,
+        "tight_low": min(tight_low, last_pullback_low),
+        "last_pullback_low": last_pullback_low,
+        "tightness": depths[-1],
+        "base_depth": max(depths),
+        "dry_up_ratio": dry_up_ratio,
+        "atr_ratio": atr_ratio,
+        "touches": len(touches),
+        "contractions": len(depths),
+        "contraction_text": pullback_text,
+        "base_length": base_len,
+        "type": "VCP"
+    }
+
+
+def get_flat_base_signal(hist):
+    recent = hist.tail(60).copy()
+    if len(recent) < 30:
+        return None
+
+    highs = recent["High"].astype(float)
+    lows = recent["Low"].astype(float)
+    closes = recent["Close"].astype(float)
+
+    pivot = float(highs.iloc[:-3].max())
+    low = float(lows.min())
+    depth = (pivot - low) / pivot if pivot > 0 else 999
+
+    if not (0.04 <= depth <= 0.15):
+        return None
+
+    last_15 = recent.tail(15)
+    close_std_pct = float(last_15["Close"].std() / last_15["Close"].mean())
+    if not np.isfinite(close_std_pct) or close_std_pct > 0.03:
+        return None
+
+    early_vol = float(recent["Volume"].head(20).mean())
+    late_vol = float(recent["Volume"].tail(10).mean())
+    dry_up_ratio = late_vol / early_vol if early_vol > 0 else 1.0
+
+    if not np.isfinite(dry_up_ratio) or dry_up_ratio > 0.80:
+        return None
+
+    tight_low = float(last_15["Low"].min())
+    atr_ratio = float(last_15["ATR_Pct"].mean() / recent["ATR_Pct"].head(20).mean()) if recent["ATR_Pct"].head(20).mean() > 0 else 1.0
+
+    return {
+        "pivot_price": pivot,
+        "tight_low": tight_low,
+        "last_pullback_low": tight_low,
+        "tightness": (pivot - tight_low) / pivot,
+        "base_depth": depth,
+        "dry_up_ratio": dry_up_ratio,
+        "atr_ratio": atr_ratio,
+        "touches": 2,
+        "contractions": 1,
+        "contraction_text": f"{depth*100:.1f}%",
+        "base_length": len(recent),
+        "type": "Flat Base"
+    }
+
+
+# ==========================================
+# 6. דירוג setup
+# ==========================================
+def calc_setup_score(alert):
+    score = 0.0
+
+    rs_score = min(max(alert["rs_65"], 0) * 250, 25)
+    tight_score = max(0, (1 - min(alert["tightness"], 0.10) / 0.10) * 20)
+    dryup_score = max(0, (1 - min(alert["dry_up_ratio"], 1.0)) * 20)
+    pivot_score = max(0, (1 - min(abs(alert["dist_to_pivot"]), 0.03) / 0.03) * 15)
+    close_score = min(max(alert["close_strength"], 0), 1) * 10
+    volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
+    touch_score = min(alert["touches"], 4) * 2.5
+    bonus = 5 if not alert["is_below_150"] else 0
+
+    score = rs_score + tight_score + dryup_score + pivot_score + close_score + volume_score + touch_score + bonus
+    return round(score, 1)
+
+
+# ==========================================
+# 7. סריקת שוק ראשית
 # ==========================================
 def scan_market():
     tickers = load_tickers()
-    if not tickers: return
-    
-    print("📥 מתחיל סריקה עמוקה... (מחפש בסיסים ארוכים עם נגיעות מרוחקות)")
-    market_ok, spy_rs = get_spy_trend()
-    
-    market_warning = "" if market_ok else "⚠️ <b>השוק חלש (SPY מתחת ל-200). סוחר בזהירות.</b>\n\n"
-    results = []
+    if not tickers:
+        return
+
+    print("📥 בודק את מגמת השוק (SPY)...")
+    spy = get_spy_data()
+
+    market_warning = ""
+    spy_rs = 0.0
+
+    if spy.empty:
+        market_warning = "🔴 <b>שגיאה: לא ניתן למשוך נתוני שוק (SPY).</b> הסריקה ממשיכה ללא פילטר מגמה.
+
+"
+    else:
+        spy_rs = float(spy.iloc[-1]["ROC_65"]) if pd.notna(spy.iloc[-1]["ROC_65"]) else 0.0
+        if not market_filter_ok(spy):
+            market_warning = "⚠️ <b>שים לב: השוק הכללי לא במצב אידיאלי לפריצות.</b> הסריקה ממשיכה, אך הסיכון לפריצות שווא גבוה.
+
+"
+
+    all_potentials = []
 
     for ticker in tickers:
-        print(f"בודק את {ticker}...", end="\r")
+        print(f"סורק את {ticker}...", end="
+")
+
         try:
-            df = yf.download(ticker, period="1y", auto_adjust=True, progress=False)
-            if len(df) < 200: continue
-            
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-                
+            df = yf.download(ticker, period=SCAN_PERIOD, auto_adjust=True, progress=False)
+            df = normalize_ohlcv_columns(df)
+
+            if df.empty or len(df) < 200:
+                continue
+
             df = add_indicators(df)
             today = df.iloc[-1]
             yesterday = df.iloc[-2]
-            
-            if pd.isna(today["SMA_200"]) or pd.isna(today["ATR_14"]): continue
-            if float(today["Close"]) < MIN_PRICE: continue
-            if float(today["DollarVol_50"]) < MIN_DOLLAR_VOL: continue
-            
-            if float(today["Close"]) < float(today["SMA_50"]): continue
-            
-            is_turnaround = float(today["Close"]) < float(today["SMA_150"])
-            
-            if is_turnaround:
-                if float(today["SMA_50"]) <= float(yesterday["SMA_50"]): continue
-                if (float(today["ROC_65"]) - spy_rs) < 0.04: continue
+            past_data = df.iloc[:-1].copy()
+
+            required_cols = ["SMA_50", "SMA_150", "SMA_200", "ATR_14", "Vol_50", "High_252", "ROC_65"]
+            if any(pd.isna(today[c]) for c in required_cols):
+                continue
+
+            close = float(today["Close"])
+            open_price = float(today["Open"])
+            high_252 = float(today["High_252"])
+            dollar_vol_50 = float(today["DollarVol_50"])
+
+            if close < MIN_PRICE or dollar_vol_50 < MIN_DOLLAR_VOL_50:
+                continue
+
+            if close <= float(today["SMA_50"]):
+                continue
+
+            is_below_150 = close < float(today["SMA_150"])
+
+            if not is_below_150:
+                if not (close > float(today["SMA_150"]) > float(today["SMA_200"])):
+                    continue
             else:
-                if (float(today["ROC_65"]) - spy_rs) < 0.02: continue
-            
-            # --- הפעלת ה-VCP Engine החכם ---
-            vcp = detect_time_spaced_vcp(df, is_turnaround)
-            if not vcp: continue
-            
-            if should_skip_spam(ticker): continue
-            
-            mc = get_market_cap(ticker)
-            if mc > 0 and mc < MIN_MARKET_CAP: continue
-            
-            pivot = vcp["pivot_price"]
-            close_price = float(today["Close"])
-            is_breakout = (float(yesterday["Close"]) <= pivot) and (close_price > pivot)
-            
-            vol_ratio = float(today["Volume"]) / float(today["Vol_50"])
+                if float(today["SMA_50"]) <= float(yesterday["SMA_50"]):
+                    continue
+
+            dist_52w = (close / high_252) - 1.0
+            max_dist = (
+                BRAIN["max_dist_from_52w_high_below_150"]
+                if is_below_150
+                else BRAIN["max_dist_from_52w_high_normal"]
+            )
+            if dist_52w < -max_dist:
+                continue
+
+            stock_rs = float(today["ROC_65"]) - float(spy_rs)
+            required_rs = BRAIN["min_rs_65"] * (2 if is_below_150 else 1)
+            if stock_rs < required_rs:
+                continue
+
+            market_cap = check_market_cap(ticker)
+            if market_cap is not None and market_cap < MIN_MARKET_CAP:
+                continue
+            if market_cap is None and not BRAIN["allow_unknown_market_cap"]:
+                continue
+
+            pattern = get_vcp_signal(past_data)
+            if not pattern:
+                pattern = get_flat_base_signal(past_data)
+            if not pattern:
+                continue
+
+            pivot = float(pattern["pivot_price"])
+            dist_to_pivot = (close / pivot) - 1.0
+
+            is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
+            is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
+
+            if not (is_breakout or is_near_breakout):
+                continue
+
+            if should_skip_spam(ticker, is_breakout):
+                continue
+
             day_range = max(float(today["High"]) - float(today["Low"]), 1e-9)
-            close_strength = (close_price - float(today["Low"])) / day_range
-            
+            close_strength = (close - float(today["Low"])) / day_range
+            vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if float(today["Vol_50"]) > 0 else 0.0
+            gap_from_pivot = (open_price / pivot) - 1.0
+
             if is_breakout:
-                if vol_ratio < 1.1 or close_strength < 0.30: continue
-                status = "🔥 פריצה אקטיבית!"
+                req_vol = 1.8 if is_below_150 else BRAIN["breakout_volume_ratio"]
+                req_close = 0.60 if is_below_150 else BRAIN["min_breakout_close_strength"]
+
+                if close_strength < req_close:
+                    continue
+                if vol_ratio < req_vol:
+                    continue
+                if gap_from_pivot > BRAIN["max_gap_above_pivot"]:
+                    continue
+
+                status = "🔥 פריצה פעילה!"
             else:
+                if close_strength < 0.45:
+                    continue
+                if vol_ratio < BRAIN["watchlist_volume_ratio"]:
+                    continue
+
                 status = "👀 מתבשלת (Watchlist)"
-                
+
+            if close > pivot * (1 + BRAIN["max_entry_extension"]):
+                continue
+
             atr = float(today["ATR_14"])
-            stop_loss = vcp["tight_low"] - (0.2 * atr)
-            risk_pct = ((close_price - stop_loss) / close_price) * 100
-            
-            results.append({
+            stop_price = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"])) - (0.5 * atr)
+
+            if stop_price >= close:
+                continue
+
+            risk_pct = (close - stop_price) / close * 100
+            if risk_pct > BRAIN["max_risk_pct"]:
+                continue
+
+            alert_data = {
                 "ticker": ticker,
-                "status": status,
-                "close": close_price,
+                "close": close,
                 "pivot": pivot,
-                "dist": vcp["dist_to_pivot"],
-                "base_depth": vcp["base_depth_pct"],
-                "tightness": vcp["tightness_pct"],
-                "touches": vcp["touches"],
-                "duration": vcp["duration_days"],
-                "vol_ratio": vol_ratio,
-                "rs": (float(today["ROC_65"]) - spy_rs) * 100,
-                "stop_loss": stop_loss,
+                "stop_loss": stop_price,
                 "risk_pct": risk_pct,
-                "is_turnaround": is_turnaround,
-                "mc_billions": mc / 1e9 if mc > 0 else 0
-            })
-            
-        except Exception as e:
+                "vol_ratio": vol_ratio,
+                "type": pattern["type"],
+                "rs_65": stock_rs,
+                "close_strength": close_strength,
+                "status": status,
+                "dist_to_pivot": dist_to_pivot,
+                "tightness": float(pattern["tightness"]),
+                "is_below_150": is_below_150,
+                "dry_up_ratio": float(pattern["dry_up_ratio"]),
+                "touches": int(pattern["touches"]),
+                "contractions": int(pattern["contractions"]),
+                "contraction_text": pattern["contraction_text"],
+                "base_depth": float(pattern["base_depth"]),
+                "base_length": int(pattern["base_length"]),
+                "market_cap": market_cap
+            }
+
+            alert_data["setup_score"] = calc_setup_score(alert_data)
+            all_potentials.append(alert_data)
+
+        except Exception:
             pass
 
-    # ==========================================
-    # 6. יצירת הדוח לטלגרם
-    # ==========================================
-    if not results:
-        send_telegram("✅ הסריקה הסתיימה. נחסמו תעלות עולות. לא נמצאו מניות עם בסיס אופקי ארוך כרגע.")
-        return
+        time.sleep(0.15)
 
-    results.sort(key=lambda x: abs(x["dist"]))
-    
-    msg = f"🎯 <b>סריקת VCP (בסיסים ארוכים ושטוחים) הסתיימה!</b>\n{market_warning}נמצאו {len(results)} סטאפים מובחרים:\n\n"
-    
-    for r in results[:10]:
-        icon = "🚀" if "פריצה" in r["status"] else "⏳"
-        warn = " ⚠️ (שיקום מתחת ל-150)" if r["is_turnaround"] else ""
-        tv_link = f"https://il.tradingview.com/chart/?symbol={r['ticker']}"
-        
-        msg += f"{icon} <b>{r['ticker']}</b> | {r['status']}{warn}\n"
-        msg += f"📐 <b>מבנה:</b> {r['touches']} נגיעות בתקרה | אורך בסיס: {r['duration']} ימי מסחר\n"
-        msg += f"📊 <b>עומק:</b> בסיס {r['base_depth']:.1f}% ⬅️ כיווץ ימני {r['tightness']:.1f}%\n"
-        msg += f"📈 <b>עוצמה:</b> {r['rs']:.1f}% | 📊 <b>ווליום:</b> {r['vol_ratio']:.1f}x\n"
-        
-        if "פריצה" in r["status"]:
-            msg += f"🎯 <b>נפרץ קו התנגדות:</b> ${r['pivot']:.2f} | 💵 <b>מחיר:</b> ${r['close']:.2f}\n"
+    print("
+" + "=" * 50)
+
+    # מיון לפי ציון setup ואז לפי קרבה לפיבוט
+    all_potentials_sorted = sorted(
+        all_potentials,
+        key=lambda x: (-x["setup_score"], abs(x["dist_to_pivot"]))
+    )
+
+    final_selection = []
+    below_150_count = 0
+
+    for stock in all_potentials_sorted:
+        if len(final_selection) >= TOP_RESULTS:
+            break
+
+        if stock["is_below_150"]:
+            if below_150_count < 3:
+                final_selection.append(stock)
+                below_150_count += 1
         else:
-            msg += f"🎯 <b>פיבוט התנגדות:</b> ${r['pivot']:.2f} (מרחק: {r['dist']:.1f}%) | 💵 <b>מחיר:</b> ${r['close']:.2f}\n"
-            
-        msg += f"🛡️ <b>סטופ טכני:</b> ${r['stop_loss']:.2f} (סיכון {r['risk_pct']:.1f}%-)\n"
-        msg += f"🔗 <a href='{tv_link}'>TradingView</a>\n"
-        msg += "────────────────\n"
-        
-        log_sent_signal(r['ticker'])
+            final_selection.append(stock)
 
-    send_telegram(msg)
+    final_bo = [s for s in final_selection if "פריצה פעילה" in s["status"]]
+    final_wl = [s for s in final_selection if "מתבשלת" in s["status"]]
+    total_sent = len(final_bo) + len(final_wl)
+
+    if total_sent > 0:
+        print(f"🔥 הסריקה הסתיימה! נמצאו {total_sent} מניות לשליחה.")
+
+        msg = "🎯 <b>סריקת VCP יומית הסתיימה!</b>
+"
+        if market_warning:
+            msg += market_warning
+
+        msg += f"<i>(מציג {total_sent} מניות מדורגות לפי איכות setup. מקסימום 3 מתחת לממוצע 150)</i>
+
+"
+
+        if final_bo:
+            msg += f"🔥 <b>פריצות אקטיביות ({len(final_bo)}):</b>
+
+"
+
+            for a in final_bo:
+                tv_link = f"https://il.tradingview.com/chart/?symbol={a['ticker']}"
+                warning_150 = " ⚠️ (מתחת ל-150)" if a["is_below_150"] else ""
+
+                msg += f"🚀 <b>{a['ticker']}</b> | {a['type']}{warning_150}
+"
+                msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}% | 📊 <b>ווליום:</b> {a['vol_ratio']:.1f}x
+"
+                msg += f"📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}% | 🫗 <b>Dry-Up:</b> {a['dry_up_ratio']:.2f} | 🔋 <b>סגירה:</b> {a['close_strength'] * 100:.0f}%
+"
+                msg += f"🔁 <b>Contractions:</b> {a['contraction_text']} | 🎯 <b>פיבוט:</b> ${a['pivot']:.2f}
+"
+                msg += f"💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f} (סיכון: {a['risk_pct']:.1f}%-)
+"
+                msg += f"🔗 <a href='{tv_link}'>גרף ב-TradingView</a>
+"
+                msg += "────────────────
+"
+
+                log_signal(a["ticker"], a["close"], a["status"])
+                save_to_smart_memory(
+                    a["ticker"], a["close"], a["stop_loss"], a["risk_pct"],
+                    a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"],
+                    a["tightness"], a["type"], "Sent", a["setup_score"],
+                    a["dry_up_ratio"], a["touches"]
+                )
+
+        if final_wl:
+            msg += f"👀 <b>מתבשלות למעקב ({len(final_wl)}):</b>
+
+"
+
+            for a in final_wl:
+                tv_link = f"https://il.tradingview.com/chart/?symbol={a['ticker']}"
+                warning_150 = " ⚠️ (מתחת ל-150)" if a["is_below_150"] else ""
+
+                msg += f"⏳ <b>{a['ticker']}</b> | {a['type']}{warning_150}
+"
+                msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📈 <b>RS:</b> {a['rs_65'] * 100:.1f}% | 📊 <b>ווליום:</b> {a['vol_ratio']:.1f}x
+"
+                msg += f"📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}% | 🫗 <b>Dry-Up:</b> {a['dry_up_ratio']:.2f} | 🔋 <b>סגירה:</b> {a['close_strength'] * 100:.0f}%
+"
+                msg += f"🔁 <b>Contractions:</b> {a['contraction_text']} | 🎯 <b>פיבוט:</b> ${a['pivot']:.2f} (מרחק: {a['dist_to_pivot'] * 100:.1f}%)
+"
+                msg += f"💵 <b>מחיר:</b> ${a['close']:.2f} | 🛡️ <b>סטופ משוער:</b> ${a['stop_loss']:.2f} (סיכון: {a['risk_pct']:.1f}%-)
+"
+                msg += f"🔗 <a href='{tv_link}'>גרף ב-TradingView</a>
+"
+                msg += "────────────────
+"
+
+                log_signal(a["ticker"], a["close"], a["status"])
+                save_to_smart_memory(
+                    a["ticker"], a["close"], a["stop_loss"], a["risk_pct"],
+                    a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"],
+                    a["tightness"], a["type"], "Sent", a["setup_score"],
+                    a["dry_up_ratio"], a["touches"]
+                )
+
+        send_telegram(msg)
+
+    else:
+        print("💤 הסריקה הסתיימה. לא נמצאו מניות חדשות לשליחה בסיבוב זה.")
+        send_telegram(
+            f"✅ הסריקה הסתיימה.
+
+{market_warning}"
+            f"אין פריצות או מניות חדשות במעקב שלא נשלחו כבר היום."
+        )
+
+    print("=" * 50)
+
 
 if __name__ == "__main__":
-    scan_market()
+    scan_market() 
