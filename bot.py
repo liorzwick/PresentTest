@@ -16,13 +16,13 @@ warnings.filterwarnings("ignore")
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
-CUSTOM_TICKERS_FILE = "mystock.csv"
+CUSTOM_TICKERS_FILE = "my_stocks.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
 MIN_DOLLAR_VOL_50 = 20_000_000
 MIN_PRICE = 12.0
 COOLDOWN_DAYS = 5
-TOP_RESULTS = 15 # 🚨 שונה ל-15 לבקשתך
+TOP_RESULTS = 15 
 SCAN_PERIOD = "1y"
 
 market_cap_cache = {}
@@ -37,9 +37,10 @@ def load_brain():
         "max_entry_extension": 0.04,          
         "breakout_volume_ratio": 1.3,         
         "watchlist_volume_ratio": 0.75,
-        "pivot_tolerance": 0.055, # 🚨 אזור ההתנגדות מוגדר כטווח של 5.5% ולא כמחיר בודד             
+        "pivot_tolerance": 0.055,             
         "max_risk_pct": 12.0,
         "allow_unknown_market_cap": True,
+        "min_atr_pct": 0.02, 
     }
     try:
         if os.path.exists("brain.json"):
@@ -150,6 +151,7 @@ def add_indicators(df):
     df["High_252"] = df["High"].rolling(252, min_periods=120).max()
     tr = pd.concat([df["High"] - df["Low"], (df["High"] - df["Prev_Close"]).abs(), (df["Low"] - df["Prev_Close"]).abs()], axis=1).max(axis=1)
     df["ATR_14"] = tr.rolling(14, min_periods=7).mean()
+    df["ATR_Pct"] = df["ATR_14"] / df["Close"] 
     return df
 
 def get_spy_data():
@@ -176,7 +178,7 @@ def check_market_cap(ticker):
 # ==========================================
 # 4. מנוע זיהוי תבניות קלאסיות (Cheat Sheet)
 # ==========================================
-def find_swing_highs(arr, window=4):
+def find_swing_highs(arr, window=5):
     arr = np.asarray(arr, dtype=float)
     peaks = []
     for i in range(window, len(arr) - window):
@@ -184,7 +186,7 @@ def find_swing_highs(arr, window=4):
             peaks.append(i)
     return peaks
 
-def find_swing_lows(arr, window=4):
+def find_swing_lows(arr, window=5):
     arr = np.asarray(arr, dtype=float)
     lows = []
     for i in range(window, len(arr) - window):
@@ -208,14 +210,19 @@ def calculate_dry_up(vols, base_start, base_end):
     return float(handle_vol / base_vol) if base_vol > 0 else 1.0
 
 # --- תבנית 1: כוס וידית (Cup & Handle) ---
-def get_cup_and_handle(highs, lows, vols, n):
+def get_cup_and_handle(highs, lows, vols, closes, n):
     swing_highs = find_swing_highs(highs)
     best_touches, best_pivot = [], 0.0
     for p_idx in swing_highs:
         if p_idx > n - 5: continue
+        
         p_val = float(highs[p_idx])
+        # סריקה היסטורית: מקבץ את כל השיאים שנוגעים בטווח של ה-5.5% מהמחיר הזה
         group = [i for i in swing_highs if i < n - 3 and abs(highs[i] - p_val) / p_val <= BRAIN["pivot_tolerance"]]
-        group = dedupe_indices(group, highs, min_sep=15, keep_higher=True)
+        
+        # אימות זמן: דורש שהנגיעות יהיו במרחק של לפחות 20 ימי מסחר אחת מהשנייה
+        group = dedupe_indices(group, highs, min_sep=20, keep_higher=True) 
+        
         if len(group) >= 2:
             group_pivot = float(np.max([highs[i] for i in group]))
             if len(group) > len(best_touches) or (len(group) == len(best_touches) and group_pivot > best_pivot):
@@ -256,7 +263,6 @@ def get_ascending_triangle(highs, lows, vols, n):
     for p_idx in swing_highs:
         if p_idx > n - 3: continue
         p_val = float(highs[p_idx])
-        # 🚨 עכשיו משתמש ב-pivot_tolerance בדיוק כמו הכוס, כדי ליצור אזור ולא קו דק!
         group = [i for i in swing_highs if i < n - 3 and abs(highs[i] - p_val) / p_val <= BRAIN["pivot_tolerance"]] 
         group = dedupe_indices(group, highs, min_sep=10, keep_higher=True)
         if len(group) >= 3: 
@@ -330,8 +336,12 @@ def get_double_bottom(highs, lows, vols, n):
         if l2 - l1 < 15 or l2 - l1 > 60: continue 
         
         val1, val2 = float(lows[l1]), float(lows[l2])
-        # משתמש באזור סלחנות כדי שתחתיות לא חייבות להיות זהות על הסנט
         if abs(val1 - val2) / val1 <= BRAIN["pivot_tolerance"]: 
+            
+            pre_downtrend_high = float(np.max(highs[max(0, l1-60):l1]))
+            if (pre_downtrend_high - val1) / pre_downtrend_high < 0.20:
+                continue
+
             mid_peak = float(np.max(highs[l1:l2]))
             if mid_peak > max_mid_peak:
                 max_mid_peak = mid_peak
@@ -356,7 +366,39 @@ def get_double_bottom(highs, lows, vols, n):
         "dry_up_ratio": 1.0, "touches": 2, "base_length": l2 - l1
     }
 
-# נתב התבניות שבודק את כל ה-4
+# --- תבנית 5: מלבן (Darvas Box) 📦 ---
+def get_darvas_box(highs, lows, vols, closes, n):
+    recent_len = 45
+    if n < recent_len + 5: return None
+    
+    box_highs = highs[-recent_len:-2]
+    box_lows = lows[-recent_len:-2]
+    
+    box_top = float(np.max(box_highs))
+    box_bottom = float(np.min(box_lows))
+    
+    box_depth = (box_top - box_bottom) / box_top
+    if box_depth < 0.05 or box_depth > 0.25: return None 
+    
+    top_touches = [i for i in range(len(box_highs)) if (box_top - box_highs[i]) / box_top <= BRAIN["pivot_tolerance"]]
+    bottom_touches = [i for i in range(len(box_lows)) if (box_lows[i] - box_bottom) / box_bottom <= BRAIN["pivot_tolerance"]]
+    
+    top_touches = dedupe_indices(top_touches, box_highs, min_sep=5, keep_higher=True)
+    bottom_touches = dedupe_indices(bottom_touches, box_lows, min_sep=5, keep_higher=False)
+    
+    if len(top_touches) >= 2 and len(bottom_touches) >= 2:
+        box_vol = np.mean(vols[-recent_len:-10]) if recent_len > 10 else 1
+        recent_vol = np.mean(vols[-5:])
+        dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
+        
+        return {
+            "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
+            "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
+            "dry_up_ratio": dry_up, "touches": len(top_touches), "base_length": top_touches[-1] - top_touches[0]
+        }
+    return None
+
+# נתב התבניות שבודק את כל ה-5
 def check_classical_patterns(hist):
     highs = hist["High"].astype(float).values
     lows = hist["Low"].astype(float).values
@@ -370,10 +412,13 @@ def check_classical_patterns(hist):
     pattern = get_ascending_triangle(highs, lows, vols, n)
     if pattern: return pattern
     
-    pattern = get_cup_and_handle(highs, lows, vols, n)
+    pattern = get_cup_and_handle(highs, lows, vols, closes, n)
     if pattern: return pattern
     
     pattern = get_double_bottom(highs, lows, vols, n)
+    if pattern: return pattern
+
+    pattern = get_darvas_box(highs, lows, vols, closes, n)
     if pattern: return pattern
     
     return None
@@ -399,7 +444,7 @@ def scan_market():
     spy_rs = float(spy.iloc[-1]["ROC_65"]) if not spy.empty and pd.notna(spy.iloc[-1]["ROC_65"]) else 0.0
 
     all_potentials, waiting_for_pivot_tickers = [], []
-    stats = {"total_scanned": 0, "pass_pattern": 0, "pass_pivot_dist": 0, "final_approved": 0}
+    stats = {"total_scanned": 0, "pass_basic": 0, "pass_pattern": 0, "pass_pivot_dist": 0, "final_approved": 0}
 
     for ticker in tickers:
         stats["total_scanned"] += 1
@@ -411,11 +456,16 @@ def scan_market():
             df = add_indicators(df)
             today, yesterday, past_data = df.iloc[-1], df.iloc[-2], df.iloc[:-1].copy()
 
-            if any(pd.isna(today[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ATR_14"]): continue
+            if any(pd.isna(today[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ATR_14", "ATR_Pct"]): continue
+            
             close, open_price = float(today["Close"]), float(today["Open"])
             if close < MIN_PRICE or float(today["DollarVol_50"]) < MIN_DOLLAR_VOL_50: continue
             if close <= float(today["SMA_50"]): continue
             
+            if float(today["ATR_Pct"]) < BRAIN["min_atr_pct"]: continue
+            
+            stats["pass_basic"] += 1
+
             is_below_150 = close < float(today["SMA_150"])
             max_dist = BRAIN["max_dist_from_52w_high_below_150"] if is_below_150 else BRAIN["max_dist_from_52w_high_normal"]
             if (close / float(today["High_252"])) - 1.0 < -max_dist: continue
@@ -465,7 +515,6 @@ def scan_market():
             stats["final_approved"] += 1
         except Exception: pass
 
-    # --- יצירת הודעת טלגרם מעוצבת ומקובצת לפי תבניות ---
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
     
@@ -477,14 +526,12 @@ def scan_market():
     msg = "🎯 <b>סריקת תבניות קלאסיות יומית!</b>\n"
     msg += f"<i>(מציג עד {TOP_RESULTS} מניות מובחרות, מסודרות לפי תבניות טכניות)</i>\n\n"
 
-    # קיבוץ המניות לפי סוג התבנית (Pattern Type)
     pattern_groups = {}
     for s in final_selection:
         ptype = s["type"]
         if ptype not in pattern_groups: pattern_groups[ptype] = []
         pattern_groups[ptype].append(s)
 
-    # בניית ההודעה לכל תבנית ותבנית
     for ptype, stocks in pattern_groups.items():
         icon = ptype.split()[0]
         pattern_name = ptype.replace(icon, "").strip()
