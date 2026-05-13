@@ -368,55 +368,62 @@ def get_double_bottom(highs, lows, vols, n):
     }
 
 def get_darvas_box(highs, lows, vols, closes, n):
-    box_length = 25  # מסתכלים על דשדוש של 5 השבועות האחרונים בערך
+    box_length = 35  # בודק היסטוריה של כ-7 שבועות לקופסה
     if n < box_length + 40: return None
-    
-    # בוחנים את חלון הקופסה (ללא היומיים האחרונים כדי לא לתפוס פריצות שווא כחלק מהקופסה)
+
+    # מבודד את החלון הרלוונטי (ללא היומיים האחרונים כדי לא לעוות פריצות נוכחיות)
     window_highs = highs[-box_length:-2]
     window_lows = lows[-box_length:-2]
-    window_closes = closes[-box_length:-2]
     
     box_top = float(np.max(window_highs))
     box_bottom = float(np.min(window_lows))
-    
-    # 1. בדיקת עומק (Darvas Box היא תבנית Flat Base הדוקה)
+
+    # 1. בדיקת עומק התבנית (קופסה חייבת להיות הדוקה, בדרך כלל לא יותר מ-15% עומק)
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.04 or box_depth > 0.20: 
-        return None  # אם הקופסה רחבה מ-20%, זה לא מלבן דרווס אלא תנודתיות פראית
-        
-    # 2. בדיקת זמן: התקרה חייבת להיות מבוססת ולא מאתמול
-    top_idx_in_window = int(np.argmax(window_highs))
-    days_since_top = (box_length - 2) - top_idx_in_window
+    if box_depth < 0.04 or box_depth > 0.15: 
+        return None 
+
+    # 2. זיהוי תנועה הצידה (Sideways) באמצעות Swing Highs
+    # כאן אנחנו פותרים את בעיית ה-V-shape (כמו ב-CTVA). 
+    local_highs = find_swing_highs(window_highs, window=3)
+    local_lows = find_swing_lows(window_lows, window=3)
     
-    if days_since_top < 12: 
-        return None  # התקרה נוצרה לפני פחות משבועיים וחצי - אין פה עדיין קופסה אמיתית
-        
-    # 3. מגמה מקדימה: מלבן מגיע אחרי עלייה!
-    # נבדוק שהמחיר 30 ימים לפני תחילת הקופסה היה נמוך משמעותית מתחתית הקופסה
-    pre_box_close = float(closes[-(box_length + 30)])
-    if pre_box_close > box_bottom: 
-        return None # המניה לא עלתה אל תוך הקופסה, אלא דשדשה או ירדה אליה
-        
-    # 4. התנהגות נוכחית: אסור לשבור את התחתית לאחרונה
-    recent_low = float(np.min(lows[-5:]))
-    if recent_low < box_bottom * 0.99: # קצת סובלנות לניעור שווא
+    # בודקים כמה מהשיאים באמת היו קרובים לתקרה (אזור התנגדות אופקי)
+    top_hits = [i for i in local_highs if (box_top - window_highs[i]) / box_top <= 0.03]
+    
+    # 🚨 חוק ברזל למלבן: אם המניה לא פגעה בתקרה, ירדה, ושוב פגעה בתקרה - זה לא מלבן! 🚨
+    if len(top_hits) < 2: 
         return None
         
-    # 5. חצי עליון: מניה חזקה שמתכוננת לפריצה תשהה בחצי העליון של הקופסה
+    # רצפה חייבת להיות ברורה (לפחות נקודת שפל אחת מובהקת שמייצרת את תחתית הקופסה)
+    bottom_hits = [i for i in local_lows if (window_lows[i] - box_bottom) / box_bottom <= 0.04]
+    if len(bottom_hits) < 1:
+        return None
+
+    # 3. זמן עיכול: הפגיעה הראשונה בתקרה הייתה חייבת להיות לפחות לפני 12 ימי מסחר
+    if (len(window_highs) - top_hits[0]) < 12: 
+        return None
+        
+    # 4. מגמה מקדימה (Darvas מחייב שהמניה נכנסה לקופסה בעלייה מלמטה, ולא התרסקה לתוכה)
+    pre_box_close = float(closes[-(box_length + 30)])
+    if pre_box_close > box_bottom: 
+        return None 
+
+    # 5. מוכנות לפריצה: המניה חייבת להיות כרגע בחצי העליון של הקופסה
     current_close = float(closes[-1])
     mid_point = box_bottom + (box_top - box_bottom) * 0.5
     if current_close < mid_point: 
-        return None # המניה זרוקה בתחתית הקופסה, לא מעניין אותנו עדיין
-        
-    # 6. מחזורי מסחר (Dry Up)
+        return None 
+
+    # 6. התייבשות מחזורים (Dry Up)
     box_vol = np.mean(vols[-box_length:-5])
     recent_vol = np.mean(vols[-5:])
     dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
-    
+
     return {
         "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
         "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
-        "dry_up_ratio": dry_up, "touches": 2, "base_length": box_length
+        "dry_up_ratio": dry_up, "touches": len(top_hits), "base_length": box_length
     }
 
     return None
