@@ -368,37 +368,57 @@ def get_double_bottom(highs, lows, vols, n):
     }
 
 def get_darvas_box(highs, lows, vols, closes, n):
-    recent_len = 45
-    if n < recent_len + 5: return None
-
-    box_highs = highs[-recent_len:-2]
-    box_lows = lows[-recent_len:-2]
-
-    box_top = float(np.max(box_highs))
-    box_bottom = float(np.min(box_lows))
-
+    box_length = 25  # מסתכלים על דשדוש של 5 השבועות האחרונים בערך
+    if n < box_length + 40: return None
+    
+    # בוחנים את חלון הקופסה (ללא היומיים האחרונים כדי לא לתפוס פריצות שווא כחלק מהקופסה)
+    window_highs = highs[-box_length:-2]
+    window_lows = lows[-box_length:-2]
+    window_closes = closes[-box_length:-2]
+    
+    box_top = float(np.max(window_highs))
+    box_bottom = float(np.min(window_lows))
+    
+    # 1. בדיקת עומק (Darvas Box היא תבנית Flat Base הדוקה)
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.05 or box_depth > 0.25: return None 
+    if box_depth < 0.04 or box_depth > 0.20: 
+        return None  # אם הקופסה רחבה מ-20%, זה לא מלבן דרווס אלא תנודתיות פראית
+        
+    # 2. בדיקת זמן: התקרה חייבת להיות מבוססת ולא מאתמול
+    top_idx_in_window = int(np.argmax(window_highs))
+    days_since_top = (box_length - 2) - top_idx_in_window
+    
+    if days_since_top < 12: 
+        return None  # התקרה נוצרה לפני פחות משבועיים וחצי - אין פה עדיין קופסה אמיתית
+        
+    # 3. מגמה מקדימה: מלבן מגיע אחרי עלייה!
+    # נבדוק שהמחיר 30 ימים לפני תחילת הקופסה היה נמוך משמעותית מתחתית הקופסה
+    pre_box_close = float(closes[-(box_length + 30)])
+    if pre_box_close > box_bottom: 
+        return None # המניה לא עלתה אל תוך הקופסה, אלא דשדשה או ירדה אליה
+        
+    # 4. התנהגות נוכחית: אסור לשבור את התחתית לאחרונה
+    recent_low = float(np.min(lows[-5:]))
+    if recent_low < box_bottom * 0.99: # קצת סובלנות לניעור שווא
+        return None
+        
+    # 5. חצי עליון: מניה חזקה שמתכוננת לפריצה תשהה בחצי העליון של הקופסה
+    current_close = float(closes[-1])
+    mid_point = box_bottom + (box_top - box_bottom) * 0.5
+    if current_close < mid_point: 
+        return None # המניה זרוקה בתחתית הקופסה, לא מעניין אותנו עדיין
+        
+    # 6. מחזורי מסחר (Dry Up)
+    box_vol = np.mean(vols[-box_length:-5])
+    recent_vol = np.mean(vols[-5:])
+    dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
+    
+    return {
+        "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
+        "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
+        "dry_up_ratio": dry_up, "touches": 2, "base_length": box_length
+    }
 
-    top_touches = [i for i in range(len(box_highs)) if (box_top - box_highs[i]) / box_top <= BRAIN["pivot_tolerance"]]
-    bottom_touches = [i for i in range(len(box_lows)) if (box_lows[i] - box_bottom) / box_bottom <= BRAIN["pivot_tolerance"]]
-
-    top_touches = dedupe_indices(top_touches, box_highs, min_sep=5, keep_higher=True)
-    bottom_touches = dedupe_indices(bottom_touches, box_lows, min_sep=5, keep_higher=False)
-
-    if len(top_touches) >= 2 and len(bottom_touches) >= 2:
-        if top_touches[-1] - top_touches[0] < 15: return None 
-        if bottom_touches[-1] - bottom_touches[0] < 10: return None 
-
-        box_vol = np.mean(vols[-recent_len:-10]) if recent_len > 10 else 1
-        recent_vol = np.mean(vols[-5:])
-        dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
-
-        return {
-            "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
-            "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
-            "dry_up_ratio": dry_up, "touches": len(top_touches), "base_length": top_touches[-1] - top_touches[0]
-        }
     return None
 
 def get_retest_signal(hist):
