@@ -171,163 +171,177 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות קלאסיות (זמנים גמישים פרופורציונלית!)
+# 4. מנוע זיהוי תבניות קלאסיות (אכזרי וקפדני)
 # ==========================================
 def calculate_dry_up(vols, base_start, base_end):
     base_vol = np.mean(vols[base_start:base_end]) if base_end > base_start else 1
     handle_vol = np.mean(vols[-5:])
     return float(handle_vol / base_vol) if base_vol > 0 else 1.0
 
-def get_cup_and_handle(highs, lows, vols, closes, n):
-    if n < 60: return None
-    
-    # 1. השפה השמאלית יכולה להיות בכל נקודה בשנתיים האחרונות (עד 20 יום אחורה)
-    recent_highs = highs[:-20]
-    if len(recent_highs) == 0: return None
-    left_lip_idx = int(np.argmax(recent_highs))
-    left_lip_val = float(recent_highs[left_lip_idx])
-    
-    # 2. תחתית הכוס
-    if left_lip_idx > len(recent_highs) - 10: return None 
-    cup_low_idx = left_lip_idx + int(np.argmin(lows[left_lip_idx: -5]))
-    cup_low_val = float(lows[cup_low_idx])
-    
-    cup_depth = (left_lip_val - cup_low_val) / left_lip_val
-    if cup_depth < 0.12 or cup_depth > 0.45: return None # עומק סביר לכוס
-    
-    # 3. השפה הימנית
-    right_side_highs = highs[cup_low_idx : -2]
-    if len(right_side_highs) == 0: return None
-    right_lip_idx = cup_low_idx + int(np.argmax(right_side_highs))
-    right_lip_val = float(highs[right_lip_idx])
-    
-    if abs(left_lip_val - right_lip_val) / left_lip_val > 0.12: return None # גמישות של 12% הבדל בין השפות
-    pivot = max(left_lip_val, right_lip_val)
-    
-    # 4. הידית - יכולה לקחת מ-3 ימים ועד 60 ימים (כ-3 חודשים)!
-    handle_len = (len(highs) - 1) - right_lip_idx
-    if handle_len < 3 or handle_len > 60: return None 
-    
-    handle_low = float(np.min(lows[right_lip_idx:]))
-    handle_depth = (right_lip_val - handle_low) / right_lip_val
-    
-    if handle_depth > cup_depth * 0.5: return None # הידית חייבת להיות רדודה ביחס לכוס (עד 50% ממנה)
-    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.4: return None # רק בחצי העליון של המבנה
-    
-    return {
-        "type": "☕ Cup & Handle", "pivot_price": pivot, "tight_low": handle_low,
-        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": cup_depth,
-        "dry_up_ratio": calculate_dry_up(vols, left_lip_idx, right_lip_idx), "touches": 2, "base_length": len(highs) - left_lip_idx
-    }
-
 def get_bull_flag(highs, lows, vols, closes, n):
-    if n < 40: return None
+    if n < 50: return None
     
-    # חיפוש שיא התורן: יכול לקרות מתישהו ב-90 ימי המסחר האחרונים (כ-4 חודשים!)
-    search_window = highs[-90:-4] 
-    if len(search_window) == 0: return None
+    # 1. מציאת השיא המוחלט של ה-40 ימים האחרונים
+    recent_highs = highs[-40:]
+    peak_idx_local = int(np.argmax(recent_highs))
+    peak_idx = (n - 40) + peak_idx_local
+    peak_val = float(highs[peak_idx])
     
-    pole_peak_idx_local = int(np.argmax(search_window))
-    absolute_peak_idx = (n - 90) + pole_peak_idx_local
-    pole_peak_val = float(highs[absolute_peak_idx])
+    # 2. זמן הדגל
+    days_since_peak = (n - 1) - peak_idx
     
-    # חיפוש תחילת המהלך: תורן יכול להיות ראלי של עד 40 ימי מסחר רצופים
-    start_search_idx = max(0, absolute_peak_idx - 40)
-    pole_start_val = float(np.min(lows[start_search_idx : absolute_peak_idx]))
+    # 🚨 חוק זמן מחמיר: דגל חייב להיות בין 7 ל-30 ימי מסחר. 4 ימים זה מוקדם מדי.
+    if days_since_peak < 7 or days_since_peak > 30: return None
     
-    if (pole_peak_val - pole_start_val) / pole_start_val < 0.18: return None # זינוק מהותי
+    # 3. התורן (Pole): חייב להיות זינוק אלים, לא עלייה איטית!
+    # בודקים רק את ה-15 ימים שלפני השיא.
+    pole_start_idx = max(0, peak_idx - 15)
+    pole_start_val = float(np.min(lows[pole_start_idx : peak_idx]))
     
-    # זמן הדגל: בין 4 ימים ל-45 ימים של "עיכול" המחיר
-    flag_length = (n - 1) - absolute_peak_idx
-    if flag_length < 4 or flag_length > 45: return None 
+    pole_run = (peak_val - pole_start_val) / pole_start_val
+    if pole_run < 0.25: return None # 🚨 חייב לפחות 25% עלייה ב-15 ימים!
     
-    flag_lows = lows[absolute_peak_idx : -1]
+    # 4. הדגל (Flag)
+    flag_highs = highs[peak_idx+1 : n]
+    flag_lows = lows[peak_idx+1 : n]
     if len(flag_lows) == 0: return None
+    
     flag_low = float(np.min(flag_lows))
     
-    flag_depth = (pole_peak_val - flag_low) / pole_peak_val
-    if flag_depth < 0.03 or flag_depth > 0.20: return None # יכול לתקן עד 20% במקרים של דגלים ארוכים
+    # אסור לאף נר בדגל לפרוץ את שיא התורן (אפילו לא קרוב, גג 98.5% מהשיא)
+    if float(np.max(flag_highs)) > peak_val * 0.985: return None
     
-    max_in_flag = float(np.max(highs[absolute_peak_idx+1 : -1]))
-    if max_in_flag > pole_peak_val * 1.01: return None # חוק הציפה - אסור לשבור את השיא באמצע הדגל
+    flag_depth = (peak_val - flag_low) / peak_val
+    if flag_depth < 0.04 or flag_depth > 0.20: return None # הדגל חייב לתקן בין 4% ל-20%
+    
+    # 5. התייבשות מחזורים (Volume Dry-up) קריטית בדגל!
+    pole_vol = np.mean(vols[pole_start_idx : peak_idx+1])
+    flag_vol = np.mean(vols[peak_idx+1 : n])
+    if flag_vol > pole_vol * 0.70: return None # 🚨 המחזור בדגל חייב לחתוך לפחות ב-30% לעומת הזינוק
     
     current_close = float(closes[-1])
-    if current_close < flag_low + (pole_peak_val - flag_low) * 0.3: return None # חייב להתחיל להראות עליה חזרה
+    if current_close < flag_low + (peak_val - flag_low) * 0.4: return None 
     
+    dry_up = float(flag_vol / pole_vol) if pole_vol > 0 else 1.0
+
     return {
-        "type": "🚩 Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low,
+        "type": "🚩 Bull Flag", "pivot_price": peak_val, "tight_low": flag_low,
         "last_pullback_low": flag_low, "tightness": flag_depth, "base_depth": flag_depth,
-        "dry_up_ratio": 1.0, "touches": 1, "base_length": flag_length
+        "dry_up_ratio": dry_up, "touches": 1, "base_length": days_since_peak
     }
 
 def get_darvas_box(highs, lows, vols, closes, n):
-    box_length = 30 
-    if n < box_length + 40: return None
+    if n < 60: return None
 
-    window_highs = highs[-box_length:-2]
-    window_lows = lows[-box_length:-2]
-    window_closes = closes[-box_length:-2]
-    
-    box_top = float(np.max(window_highs))
-    box_bottom = float(np.min(window_lows))
+    window_highs = highs[-40:]
+    top_idx_local = int(np.argmax(window_highs))
+    top_idx = (n - 40) + top_idx_local
+    box_top = float(highs[top_idx])
+
+    days_since_top = (n - 1) - top_idx
+
+    if days_since_top < 15: return None
+
+    lows_since_top = lows[top_idx:]
+    box_bottom = float(np.min(lows_since_top))
 
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.04 or box_depth > 0.12: return None 
+    if box_depth < 0.04 or box_depth > 0.15: return None
 
-    days_in_box = np.sum((window_closes >= box_bottom * 0.98) & (window_closes <= box_top * 1.02))
-    if (days_in_box / len(window_closes)) < 0.85: return None 
-        
-    top_touches = np.where(window_highs >= box_top * 0.985)[0]
-    if len(top_touches) < 2: return None
-    if top_touches[-1] - top_touches[0] < 12: return None 
+    pre_box_idx = max(0, top_idx - 20)
+    if float(closes[pre_box_idx]) > box_bottom * 0.95: return None 
 
-    pre_box_close = float(closes[-(box_length + 20)])
-    if pre_box_close >= box_bottom * 0.93: return None 
+    closes_since_top = closes[top_idx:]
+    in_box = np.sum((closes_since_top >= box_bottom * 0.98) & (closes_since_top <= box_top * 1.02))
+    if in_box / len(closes_since_top) < 0.80: return None
 
     current_close = float(closes[-1])
-    if current_close < box_bottom + (box_top - box_bottom) * 0.75: return None 
-
-    box_vol = np.mean(vols[-box_length:-5])
-    recent_vol = np.mean(vols[-5:])
-    dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
+    if current_close < box_bottom + (box_top - box_bottom) * 0.70: return None
 
     return {
         "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
         "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
-        "dry_up_ratio": dry_up, "touches": len(top_touches), "base_length": box_length
+        "dry_up_ratio": 1.0, "touches": 2, "base_length": days_since_top
     }
 
-def get_double_bottom(highs, lows, vols, n):
-    if n < 100: return None
+def get_cup_and_handle(highs, lows, vols, closes, n):
+    if n < 150: return None
+
+    left_lip_idx_local = int(np.argmax(highs[-150:]))
+    left_lip_idx = (n - 150) + left_lip_idx_local
     
-    # הרגל הראשונה יכולה לקרות הרחק בעבר (עד מעל לשנה אחורה)
-    recent_lows = lows[-300:-20]
-    if len(recent_lows) == 0: return None
-    left_bottom_idx = int(np.argmin(recent_lows))
-    left_bottom_val = float(recent_lows[left_bottom_idx])
+    days_since_left_lip = (n - 1) - left_lip_idx
+    if days_since_left_lip < 40: return None 
     
-    mid_section = highs[left_bottom_idx : -5]
-    if len(mid_section) < 10: return None
-    mid_peak_idx = left_bottom_idx + int(np.argmax(mid_section))
+    left_lip_val = float(highs[left_lip_idx])
+
+    cup_low_idx_local = int(np.argmin(lows[left_lip_idx:]))
+    cup_low_idx = left_lip_idx + cup_low_idx_local
+    cup_low_val = float(lows[cup_low_idx])
+
+    cup_depth = (left_lip_val - cup_low_val) / left_lip_val
+    if cup_depth < 0.12 or cup_depth > 0.45: return None
+
+    right_lip_idx_local = int(np.argmax(highs[cup_low_idx:]))
+    right_lip_idx = cup_low_idx + right_lip_idx_local
+    right_lip_val = float(highs[right_lip_idx])
+
+    if abs(left_lip_val - right_lip_val) / left_lip_val > 0.12: return None
+
+    days_since_right_lip = (n - 1) - right_lip_idx
+    if days_since_right_lip < 4 or days_since_right_lip > 35: return None
+
+    handle_low = float(np.min(lows[right_lip_idx:]))
+    handle_depth = (right_lip_val - handle_low) / right_lip_val
+
+    if handle_depth > cup_depth * 0.5: return None
+    if float(closes[-1]) < cup_low_val + (right_lip_val - cup_low_val) * 0.5: return None
+
+    pivot = max(left_lip_val, right_lip_val)
+    
+    return {
+        "type": "☕ Cup & Handle", "pivot_price": pivot, "tight_low": handle_low,
+        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": cup_depth,
+        "dry_up_ratio": calculate_dry_up(vols, left_lip_idx, right_lip_idx), "touches": 2, "base_length": days_since_left_lip
+    }
+
+def get_double_bottom(highs, lows, vols, closes, n):
+    if n < 150: return None
+
+    recent_lows = lows[-150:]
+    left_bottom_idx_local = int(np.argmin(recent_lows))
+    left_bottom_idx = (n - 150) + left_bottom_idx_local
+
+    days_since_left = (n - 1) - left_bottom_idx
+    if days_since_left < 30: return None
+
+    mid_peak_idx_local = int(np.argmax(highs[left_bottom_idx:]))
+    mid_peak_idx = left_bottom_idx + mid_peak_idx_local
     mid_peak_val = float(highs[mid_peak_idx])
-    
-    right_section = lows[mid_peak_idx : -1]
-    if len(right_section) < 5: return None
-    right_bottom_idx = mid_peak_idx + int(np.argmin(right_section))
+
+    if mid_peak_idx == (n - 1): return None
+
+    right_bottom_idx_local = int(np.argmin(lows[mid_peak_idx:]))
+    right_bottom_idx = mid_peak_idx + right_bottom_idx_local
     right_bottom_val = float(lows[right_bottom_idx])
-    
-    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.08: return None # גמישות ברגליים
-    
+    left_bottom_val = float(lows[left_bottom_idx])
+
+    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.08: return None
+
     base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / mid_peak_val
-    if base_depth < 0.10 or base_depth > 0.40: return None # יכול להיות עמוק עד 40%
-    
+    if base_depth < 0.10 or base_depth > 0.40: return None
+
+    days_since_right = (n - 1) - right_bottom_idx
+    if days_since_right < 3: return None
+
     pivot = mid_peak_val
+    if float(closes[-1]) < right_bottom_val + (mid_peak_val - right_bottom_val) * 0.5: return None
+
     handle_low = float(np.min(lows[right_bottom_idx:]))
-    handle_depth = (pivot - handle_low) / pivot
     
     return {
         "type": "🧲 Double Bottom", "pivot_price": pivot, "tight_low": handle_low,
-        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": base_depth,
+        "last_pullback_low": handle_low, "tightness": (pivot - handle_low)/pivot, "base_depth": base_depth,
         "dry_up_ratio": 1.0, "touches": 2, "base_length": right_bottom_idx - left_bottom_idx
     }
 
@@ -347,14 +361,13 @@ def check_classical_patterns(hist):
     pattern = get_cup_and_handle(highs, lows, vols, closes, n)
     if pattern: return pattern
 
-    pattern = get_double_bottom(highs, lows, vols, n)
+    pattern = get_double_bottom(highs, lows, vols, closes, n)
     if pattern: return pattern
 
     pattern = get_darvas_box(highs, lows, vols, closes, n)
     if pattern: return pattern
 
     return None
-
 
 # ==========================================
 # 5. דירוג וסריקה
