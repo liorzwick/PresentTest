@@ -19,14 +19,11 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
 CUSTOM_TICKERS_FILE = "mystock.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
-# ✅ עודכן ל-15 מיליון דולר לפי בקשתך
-MIN_DOLLAR_VOL_50 = 15_000_000
-# ✅ עודכן ל-8 דולר לפי בקשתך
-MIN_PRICE = 8.0
+MIN_DOLLAR_VOL_50 = 15_000_000  # 15 מיליון דולר מחזור דולרי מינימלי
+MIN_PRICE = 8.0                 # 8 דולר מחיר מינימלי
 COOLDOWN_DAYS = 5
 TOP_RESULTS = 15 
-# ✅ שונה לשנתיים כדי לאפשר חישוב נכון של ממוצע 200 ושיא 52 שבועות
-SCAN_PERIOD = "2y"
+SCAN_PERIOD = "2y"              # שנתיים כדי לבסס ממוצעים ארוכים כראוי
 
 market_cap_cache = {}
 
@@ -71,7 +68,7 @@ def append_dataframe(df, file_path):
 
 def send_telegram(message):
     print("\n" + "="*25)
-    print(message)
+    print("שולח הודעה מסכמת לטלגרם...")
     print("="*25 + "\n")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -79,8 +76,8 @@ def send_telegram(message):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         requests.post(url, json=payload, timeout=12)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ שגיאה בשליחה לטלגרם: {e}")
 
 def save_to_smart_memory(ticker, price, stop_loss, risk_pct, vol_ratio, pivot, close_strength, rs_65, tightness, pattern_type, status, setup_score, dry_up_ratio, touches):
     memory_file = "smart_memory.csv"
@@ -169,253 +166,113 @@ def get_spy_data():
     except Exception: pass
     return pd.DataFrame()
 
-def check_market_cap(ticker):
-    if ticker in market_cap_cache: return market_cap_cache[ticker]
-    market_cap = None
-    try:
-        t = yf.Ticker(ticker)
-        fi = t.fast_info
-        if fi: market_cap = fi.get("marketCap", None) or fi.get("market_cap", None)
-    except Exception: pass
-    market_cap_cache[ticker] = market_cap
-    return market_cap
-
 # ==========================================
-# 4. מנוע זיהוי תבניות קלאסיות (Cheat Sheet)
+# 4. מנוע זיהוי תבניות קלאסיות (מבוסס מבנה)
 # ==========================================
-def find_swing_highs(arr, window=5):
-    arr = np.asarray(arr, dtype=float)
-    peaks = []
-    for i in range(window, len(arr) - window):
-        if arr[i] == np.max(arr[i - window:i + window + 1]) and arr[i] > arr[i - 1]:
-            peaks.append(i)
-    return peaks
-
-def find_swing_lows(arr, window=5):
-    arr = np.asarray(arr, dtype=float)
-    lows = []
-    for i in range(window, len(arr) - window):
-        if arr[i] == np.min(arr[i - window:i + window + 1]) and arr[i] < arr[i - 1]:
-            lows.append(i)
-    return lows
-
-def dedupe_indices(indices, values, min_sep=10, keep_higher=True):
-    if not indices: return []
-    kept = [sorted(indices)[0]]
-    for idx in sorted(indices)[1:]:
-        if idx - kept[-1] >= min_sep: kept.append(idx)
-        else:
-            if keep_higher and values[idx] > values[kept[-1]]: kept[-1] = idx
-            elif not keep_higher and values[idx] < values[kept[-1]]: kept[-1] = idx
-    return kept
-
 def calculate_dry_up(vols, base_start, base_end):
     base_vol = np.mean(vols[base_start:base_end]) if base_end > base_start else 1
     handle_vol = np.mean(vols[-5:])
     return float(handle_vol / base_vol) if base_vol > 0 else 1.0
 
 def get_cup_and_handle(highs, lows, vols, closes, n):
-    swing_highs = find_swing_highs(highs)
-    best_touches, best_pivot = [], 0.0
-    for p_idx in swing_highs:
-        if p_idx > n - 5: continue
-        p_val = float(highs[p_idx])
-        group = [i for i in swing_highs if i < n - 3 and abs(highs[i] - p_val) / p_val <= BRAIN["pivot_tolerance"]]
-        group = dedupe_indices(group, highs, min_sep=20, keep_higher=True) 
-
-        if len(group) >= 2:
-            group_pivot = float(np.max([highs[i] for i in group]))
-            if len(group) > len(best_touches) or (len(group) == len(best_touches) and group_pivot > best_pivot):
-                best_touches, best_pivot = group, group_pivot
-
-    if len(best_touches) < 2: return None
-    pivot = best_pivot
-    first_touch, last_touch = best_touches[0], best_touches[-1]
-
-    base_len = last_touch - first_touch
-    if base_len < 20 or base_len > 150: return None 
-
-    cup_low_idx = first_touch + np.argmin(lows[first_touch:last_touch+1])
-    if cup_low_idx - first_touch < 5 or last_touch - cup_low_idx < 5: return None
-
-    middle_highs = highs[first_touch+1:last_touch]
-    if len(middle_highs) > 0 and np.max(middle_highs) > pivot * 1.02: return None
-
-    cup_low = float(lows[cup_low_idx])
-    cup_depth = (pivot - cup_low) / pivot
-    if cup_depth < 0.15 or cup_depth > 0.50: return None 
-
-    handle_len = n - last_touch
-    if handle_len < 3 or handle_len > 30: return None 
-
-    handle_low = float(np.min(lows[last_touch:]))
-    handle_depth = (pivot - handle_low) / pivot
-
-    if handle_low < cup_low + (pivot - cup_low) * 0.5: return None
-    if handle_depth > cup_depth * 0.5: return None
-
+    if n < 60: return None
+    
+    # 1. השפה השמאלית
+    recent_highs = highs[-100:-10]
+    if len(recent_highs) == 0: return None
+    left_lip_idx = int(np.argmax(recent_highs))
+    left_lip_val = float(recent_highs[left_lip_idx])
+    
+    # 2. תחתית הכוס
+    if left_lip_idx > len(recent_highs) - 15: return None 
+    cup_low_idx = left_lip_idx + int(np.argmin(lows[left_lip_idx: -5]))
+    cup_low_val = float(lows[cup_low_idx])
+    
+    cup_depth = (left_lip_val - cup_low_val) / left_lip_val
+    if cup_depth < 0.12 or cup_depth > 0.45: return None 
+    
+    # 3. השפה הימנית
+    right_side_highs = highs[cup_low_idx : -2]
+    if len(right_side_highs) == 0: return None
+    right_lip_idx = cup_low_idx + int(np.argmax(right_side_highs))
+    right_lip_val = float(highs[right_lip_idx])
+    
+    if abs(left_lip_val - right_lip_val) / left_lip_val > 0.08: return None
+    pivot = max(left_lip_val, right_lip_val)
+    
+    # 4. הידית
+    handle_len = (len(highs) - 1) - right_lip_idx
+    if handle_len < 3 or handle_len > 25: return None 
+    
+    handle_low = float(np.min(lows[right_lip_idx:]))
+    handle_depth = (right_lip_val - handle_low) / right_lip_val
+    
+    if handle_depth > cup_depth * 0.6: return None 
+    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.4: return None 
+    
     return {
         "type": "☕ Cup & Handle", "pivot_price": pivot, "tight_low": handle_low,
         "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": cup_depth,
-        "dry_up_ratio": calculate_dry_up(vols, first_touch, last_touch), "touches": len(best_touches), "base_length": base_len
-    }
-
-def get_ascending_triangle(highs, lows, vols, n):
-    swing_highs = find_swing_highs(highs)
-    best_touches, best_pivot = [], 0.0
-    for p_idx in swing_highs:
-        if p_idx > n - 3: continue
-        p_val = float(highs[p_idx])
-        group = [i for i in swing_highs if i < n - 3 and abs(highs[i] - p_val) / p_val <= BRAIN["pivot_tolerance"]] 
-        group = dedupe_indices(group, highs, min_sep=10, keep_higher=True)
-        if len(group) >= 3: 
-            group_pivot = float(np.max([highs[i] for i in group]))
-            if len(group) > len(best_touches): best_touches, best_pivot = group, group_pivot
-
-    if len(best_touches) < 3: return None
-
-    pullback_lows = []
-    for a, b in zip(best_touches[:-1], best_touches[1:]):
-        pullback_lows.append(float(np.min(lows[a:b+1])))
-
-    is_ascending = all(pullback_lows[i+1] >= pullback_lows[i] * 0.98 for i in range(len(pullback_lows)-1))
-    if not is_ascending: return None
-
-    pivot = best_pivot
-    base_len = best_touches[-1] - best_touches[0]
-    base_depth = (pivot - min(pullback_lows)) / pivot
-    handle_low = float(np.min(lows[best_touches[-1]:]))
-    handle_depth = (pivot - handle_low) / pivot
-
-    return {
-        "type": "📐 Ascending Triangle", "pivot_price": pivot, "tight_low": handle_low,
-        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": base_depth,
-        "dry_up_ratio": calculate_dry_up(vols, best_touches[0], best_touches[-1]), "touches": len(best_touches), "base_length": base_len
+        "dry_up_ratio": calculate_dry_up(vols, left_lip_idx, right_lip_idx), "touches": 2, "base_length": len(highs) - left_lip_idx
     }
 
 def get_bull_flag(highs, lows, vols, closes, n):
-    recent_40 = highs[-40:]
-    if len(recent_40) < 20: return None
-
-    pole_peak_idx = n - 40 + np.argmax(recent_40)
-    if pole_peak_idx > n - 4: return None 
-    if pole_peak_idx < n - 20: return None 
-
-    pole_start_idx = max(0, pole_peak_idx - 15)
-    pole_start_val = float(np.min(lows[pole_start_idx:pole_peak_idx]))
-    pole_peak_val = float(highs[pole_peak_idx])
-
-    if (pole_peak_val - pole_start_val) / pole_start_val < 0.20: return None 
-
-    flag_low = float(np.min(lows[pole_peak_idx:]))
+    if n < 30: return None
+    
+    recent_30_highs = highs[-30:-2]
+    if len(recent_30_highs) == 0: return None
+    pole_peak_idx = int(np.argmax(recent_30_highs))
+    
+    if pole_peak_idx < 5 or pole_peak_idx > 27: return None 
+    
+    pole_peak_val = float(recent_30_highs[pole_peak_idx])
+    pole_start_val = float(np.min(lows[-30:-2][:pole_peak_idx+1]))
+    
+    if (pole_peak_val - pole_start_val) / pole_start_val < 0.12: return None 
+    
+    flag_zone_lows = lows[-30:][pole_peak_idx+1:]
+    if len(flag_zone_lows) == 0: return None
+    flag_low = float(np.min(flag_zone_lows))
+    
     flag_depth = (pole_peak_val - flag_low) / pole_peak_val
     if flag_depth > 0.15: return None 
-
-    flag_len = n - pole_peak_idx
-    pole_vol = np.mean(vols[pole_start_idx:pole_peak_idx+1])
-    flag_vol = np.mean(vols[pole_peak_idx:])
-    dry_up = flag_vol / pole_vol if pole_vol > 0 else 1.0
-
-    if dry_up > 0.60: return None 
-
-    local_peaks = find_swing_highs(highs[pole_peak_idx:], window=2)
-    pivot = float(highs[pole_peak_idx + local_peaks[-1]]) if local_peaks else pole_peak_val * 0.98
-
+    
+    current_close = float(closes[-1])
+    if current_close < flag_low + (pole_peak_val - flag_low) * 0.4: return None 
+    
     return {
-        "type": "🚩 Bull Flag", "pivot_price": pivot, "tight_low": flag_low,
+        "type": "🚩 Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low,
         "last_pullback_low": flag_low, "tightness": flag_depth, "base_depth": flag_depth,
-        "dry_up_ratio": dry_up, "touches": 1, "base_length": flag_len
-    }
-
-def get_double_bottom(highs, lows, vols, n):
-    swing_lows = find_swing_lows(lows, window=5)
-    if len(swing_lows) < 2: return None
-
-    best_pair, max_mid_peak = None, 0.0
-    for i in range(len(swing_lows)-1):
-        l1, l2 = swing_lows[i], swing_lows[i+1]
-        if l2 - l1 < 15 or l2 - l1 > 60: continue 
-
-        val1, val2 = float(lows[l1]), float(lows[l2])
-        if abs(val1 - val2) / val1 <= BRAIN["pivot_tolerance"]: 
-
-            pre_downtrend_high = float(np.max(highs[max(0, l1-60):l1]))
-            if (pre_downtrend_high - val1) / pre_downtrend_high < 0.20:
-                continue
-
-            mid_peak = float(np.max(highs[l1:l2]))
-            if mid_peak > max_mid_peak:
-                max_mid_peak = mid_peak
-                best_pair = (l1, l2)
-
-    if not best_pair: return None
-    l1, l2 = best_pair
-    pivot = max_mid_peak 
-
-    base_depth = (pivot - float(lows[l1])) / pivot
-    if base_depth < 0.15: return None
-
-    if n - l2 > 25: return None 
-    if np.max(highs[l2:]) > pivot * 1.02: return None 
-
-    handle_low = float(np.min(lows[l2:]))
-    handle_depth = (pivot - handle_low) / pivot
-
-    return {
-        "type": "🧲 Double Bottom", "pivot_price": pivot, "tight_low": handle_low,
-        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": base_depth,
-        "dry_up_ratio": 1.0, "touches": 2, "base_length": l2 - l1
+        "dry_up_ratio": 1.0, "touches": 1, "base_length": (len(highs) - 1) - pole_peak_idx
     }
 
 def get_darvas_box(highs, lows, vols, closes, n):
-    box_length = 35  # בודק היסטוריה של כ-7 שבועות לקופסה
+    box_length = 30 
     if n < box_length + 40: return None
 
-    # מבודד את החלון הרלוונטי (ללא היומיים האחרונים כדי לא לעוות פריצות נוכחיות)
     window_highs = highs[-box_length:-2]
     window_lows = lows[-box_length:-2]
+    window_closes = closes[-box_length:-2]
     
     box_top = float(np.max(window_highs))
     box_bottom = float(np.min(window_lows))
 
-    # 1. בדיקת עומק התבנית (קופסה חייבת להיות הדוקה, בדרך כלל לא יותר מ-15% עומק)
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.04 or box_depth > 0.15: 
-        return None 
+    if box_depth < 0.04 or box_depth > 0.15: return None 
 
-    # 2. זיהוי תנועה הצידה (Sideways) באמצעות Swing Highs
-    # כאן אנחנו פותרים את בעיית ה-V-shape (כמו ב-CTVA). 
-    local_highs = find_swing_highs(window_highs, window=3)
-    local_lows = find_swing_lows(window_lows, window=3)
-    
-    # בודקים כמה מהשיאים באמת היו קרובים לתקרה (אזור התנגדות אופקי)
-    top_hits = [i for i in local_highs if (box_top - window_highs[i]) / box_top <= 0.03]
-    
-    # 🚨 חוק ברזל למלבן: אם המניה לא פגעה בתקרה, ירדה, ושוב פגעה בתקרה - זה לא מלבן! 🚨
-    if len(top_hits) < 2: 
-        return None
+    days_in_box = np.sum((window_closes >= box_bottom * 0.98) & (window_closes <= box_top * 1.02))
+    if (days_in_box / len(window_closes)) < 0.70: return None 
         
-    # רצפה חייבת להיות ברורה (לפחות נקודת שפל אחת מובהקת שמייצרת את תחתית הקופסה)
-    bottom_hits = [i for i in local_lows if (window_lows[i] - box_bottom) / box_bottom <= 0.04]
-    if len(bottom_hits) < 1:
-        return None
+    top_touches = np.where(window_highs >= box_top * 0.975)[0]
+    if len(top_touches) < 2: return None
+    if top_touches[-1] - top_touches[0] < 10: return None 
 
-    # 3. זמן עיכול: הפגיעה הראשונה בתקרה הייתה חייבת להיות לפחות לפני 12 ימי מסחר
-    if (len(window_highs) - top_hits[0]) < 12: 
-        return None
-        
-    # 4. מגמה מקדימה (Darvas מחייב שהמניה נכנסה לקופסה בעלייה מלמטה, ולא התרסקה לתוכה)
-    pre_box_close = float(closes[-(box_length + 30)])
-    if pre_box_close > box_bottom: 
-        return None 
+    pre_box_close = float(closes[-(box_length + 20)])
+    if pre_box_close >= box_bottom * 0.95: return None 
 
-    # 5. מוכנות לפריצה: המניה חייבת להיות כרגע בחצי העליון של הקופסה
     current_close = float(closes[-1])
-    mid_point = box_bottom + (box_top - box_bottom) * 0.5
-    if current_close < mid_point: 
-        return None 
+    if current_close < box_bottom + (box_top - box_bottom) * 0.65: return None 
 
-    # 6. התייבשות מחזורים (Dry Up)
     box_vol = np.mean(vols[-box_length:-5])
     recent_vol = np.mean(vols[-5:])
     dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
@@ -423,82 +280,45 @@ def get_darvas_box(highs, lows, vols, closes, n):
     return {
         "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
         "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
-        "dry_up_ratio": dry_up, "touches": len(top_hits), "base_length": box_length
+        "dry_up_ratio": dry_up, "touches": len(top_touches), "base_length": box_length
     }
 
-    return None
-
-def get_retest_signal(hist):
-    recent = hist.tail(300).copy()
-    if len(recent) < 100: return None
-
-    highs = recent["High"].astype(float).values
-    lows = recent["Low"].astype(float).values
-    closes = recent["Close"].astype(float).values
-    vols = recent["Volume"].astype(float).values
-    n = len(recent)
-
-    search_highs = highs[-60:-5]
-    if len(search_highs) == 0: return None
-
-    markup_peak_val = float(np.max(search_highs))
-    markup_peak_idx = int(n - 60 + np.argmax(search_highs))
-
-    pre_breakout_highs = highs[:markup_peak_idx]
-    if len(pre_breakout_highs) < 40: return None
-
-    swing_highs = find_swing_highs(pre_breakout_highs, window=4)
-    best_touches, best_pivot = [], 0.0
-
-    for p_idx in swing_highs:
-        if p_idx > len(pre_breakout_highs) - 3: continue
-        p_val = float(pre_breakout_highs[p_idx])
-        group = [i for i in swing_highs if i < len(pre_breakout_highs) - 3 and abs(pre_breakout_highs[i] - p_val) / p_val <= BRAIN["pivot_tolerance"]]
-        group = dedupe_indices(group, pre_breakout_highs, min_sep=10, keep_higher=True)
-
-        if len(group) >= BRAIN["min_touch_count"]:
-            group_pivot = float(np.max([pre_breakout_highs[i] for i in group]))
-            if len(group) > len(best_touches) or (len(group) == len(best_touches) and group_pivot > best_pivot):
-                best_touches, best_pivot = group, group_pivot
-
-    if len(best_touches) < BRAIN["min_touch_count"]: return None
-    pivot = best_pivot
-
-    if markup_peak_val < pivot * 1.08: return None
-
-    base_len = best_touches[-1] - best_touches[0]
-    if base_len < 20: return None
-
-    pullback_zone_lows = lows[markup_peak_idx:]
-    if len(pullback_zone_lows) == 0: return None
-    lowest_since_peak = float(np.min(pullback_zone_lows))
-    if lowest_since_peak < pivot * 0.965: return None
-
-    current_close = closes[-1]
-    dist_to_pivot = (current_close / pivot) - 1.0
-    if dist_to_pivot < -0.025 or dist_to_pivot > 0.045: return None
-
-    breakout_vol = np.mean(vols[max(0, markup_peak_idx-20):markup_peak_idx+1])
-    pullback_vol = np.mean(vols[-5:])
-    if breakout_vol == 0: return None
-    dry_up_ratio = float(pullback_vol / breakout_vol)
-    if dry_up_ratio > 0.85: return None
-
-    current_low = float(np.min(lows[-5:]))
-    pullback_depth = (markup_peak_val - current_low) / markup_peak_val
-
+def get_double_bottom(highs, lows, vols, n):
+    if n < 80: return None
+    
+    recent_lows = lows[-60:-10]
+    if len(recent_lows) == 0: return None
+    left_bottom_idx = int(np.argmin(recent_lows))
+    left_bottom_val = float(recent_lows[left_bottom_idx])
+    
+    mid_section = highs[left_bottom_idx : -5]
+    if len(mid_section) < 5: return None
+    mid_peak_idx = left_bottom_idx + int(np.argmax(mid_section))
+    mid_peak_val = float(highs[mid_peak_idx])
+    
+    right_section = lows[mid_peak_idx : -1]
+    if len(right_section) < 3: return None
+    right_bottom_idx = mid_peak_idx + int(np.argmin(right_section))
+    right_bottom_val = float(lows[right_bottom_idx])
+    
+    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.05: return None
+    
+    base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / mid_peak_val
+    if base_depth < 0.10: return None
+    
+    pivot = mid_peak_val
+    handle_low = float(np.min(lows[right_bottom_idx:]))
+    handle_depth = (pivot - handle_low) / pivot
+    
     return {
-        "type": "🔄 Pullback (Retest)", "pivot_price": pivot, "tight_low": current_low,
-        "last_pullback_low": current_low, "tightness": pullback_depth, "base_depth": (pivot - float(np.min(lows[best_touches[0]:markup_peak_idx]))) / pivot,
-        "dry_up_ratio": dry_up_ratio, "touches": len(best_touches), "base_length": base_len
+        "type": "🧲 Double Bottom", "pivot_price": pivot, "tight_low": handle_low,
+        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": base_depth,
+        "dry_up_ratio": 1.0, "touches": 2, "base_length": right_bottom_idx - left_bottom_idx
     }
 
 def check_classical_patterns(hist):
     hist_filtered = hist.dropna(subset=['High', 'Low', 'Volume', 'Close'])
-    if len(hist_filtered) < 100: return None
-
-    pattern = get_retest_signal(hist_filtered)
-    if pattern: return pattern
+    if len(hist_filtered) < 60: return None
 
     highs = hist_filtered["High"].astype(float).values
     lows = hist_filtered["Low"].astype(float).values
@@ -507,9 +327,6 @@ def check_classical_patterns(hist):
     n = len(hist_filtered)
 
     pattern = get_bull_flag(highs, lows, vols, closes, n)
-    if pattern: return pattern
-
-    pattern = get_ascending_triangle(highs, lows, vols, n)
     if pattern: return pattern
 
     pattern = get_cup_and_handle(highs, lows, vols, closes, n)
@@ -538,8 +355,7 @@ def calc_setup_score(alert):
 
 def scan_market():
     tickers = load_tickers()
-    # ✅ הדפסה חשובה: בודק כמה מניות נטענו מהקובץ
-    print(f"✅ נטענו {len(tickers)} מניות לסריקה.")
+    print(f"✅ נטענו {len(tickers)} מניות לסריקה מתוך הקובץ.")
     if not tickers: return
 
     spy = get_spy_data()
@@ -588,29 +404,23 @@ def scan_market():
             vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if float(today["Vol_50"]) > 0 else 0.0
             close_strength = (close - float(today["Low"])) / max(float(today["High"]) - float(today["Low"]), 1e-9)
 
-            if "Pullback" in pattern["type"]:
-                status = "🔄 ריטסט (Pullback)"
-            else:
-                is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
-                is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
+            is_breakout = float(yesterday["Close"]) <= pivot and close > pivot
+            is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
 
-                if is_breakout:
-                    status = "🔥 פריצה פעילה!" if close_strength >= 0.55 and vol_ratio >= 1.3 else "🪑 ספסל"
-                elif is_near_breakout:
-                    status = "👀 מתבשלת (Watchlist)"
-                else:
-                    status = "🪑 ספסל"
+            if is_breakout:
+                status = "🔥 פריצה פעילה!" if close_strength >= 0.55 and vol_ratio >= 1.3 else "🪑 ספסל"
+            elif is_near_breakout:
+                status = "👀 מתבשלת (Watchlist)"
+            else:
+                status = "🪑 ספסל"
 
             stop_price = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"])) - (0.5 * float(today["ATR_14"]))
             risk_pct = (close - stop_price) / close * 100
 
-            if status not in ["🪑 ספסל", "🔄 ריטסט (Pullback)"]:
+            if status != "🪑 ספסל":
                 if stop_price >= close or risk_pct > 12.0: status = "🪑 ספסל"
-            elif status == "🔄 ריטסט (Pullback)":
-                if stop_price >= close or risk_pct > 15.0: status = "🪑 ספסל"
 
-            # ✅ מנגנון האנטי ספאם כרגע בהערה כדי שתוכל לבדוק מבלי שזה יחסום אותך
-            # if should_skip_spam(ticker, status): continue
+            if should_skip_spam(ticker, status): continue
 
             if status == "🪑 ספסל": waiting_for_pivot_tickers.append(f"{ticker} ({dist_to_pivot*100:.1f}%)")
 
@@ -627,12 +437,11 @@ def scan_market():
             all_potentials.append(alert_data)
             stats["final_approved"] += 1
 
-        # ✅ הדפסת השגיאות למסך כדי שלא תהיה עיוור לקריסות פנימיות
         except Exception as e: 
             print(f"\n⚠️ שגיאה בסימול {ticker}: {e}")
 
-    # ✅ הדפסת סטטיסטיקות הסריקה בסוף
-    print("\n--- 📊 דוח סינון סריקה יומית 📊 ---")
+    # הדפסות של מערכת הסינון מועברות לקונסול בלבד:
+    print("\n\n--- 📊 דוח סינון סריקה יומית 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
     print("----------------------------------\n")
@@ -661,7 +470,7 @@ def scan_market():
         msg += f"{icon} <b>תבנית {pattern_name} ({len(stocks)} מניות):</b>\n\n"
 
         for a in stocks:
-            status_icon = "🔥" if "פריצה" in a["status"] else "⏳" if "מתבשלת" in a["status"] else "🔄" if "ריטסט" in a["status"] else "🪑"
+            status_icon = "🔥" if "פריצה" in a["status"] else "⏳" if "מתבשלת" in a["status"] else "🪑"
             clean_status = a['status'].replace(' (Watchlist)', '')
 
             msg += f"{status_icon} <b>{a['ticker']}</b> | סטטוס: {clean_status}\n"
