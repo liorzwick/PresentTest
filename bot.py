@@ -19,30 +19,30 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
 CUSTOM_TICKERS_FILE = "mystock.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
-MIN_DOLLAR_VOL_50 = 15_000_000  # 15 מיליון דולר מחזור דולרי מינימלי
-MIN_PRICE = 8.0                 # 8 דולר מחיר מינימלי
+MIN_DOLLAR_VOL_50 = 15_000_000  
+MIN_PRICE = 8.0                 
 COOLDOWN_DAYS = 5
 TOP_RESULTS = 15 
-SCAN_PERIOD = "2y"              # שנתיים כדי לבסס ממוצעים ארוכים כראוי
+SCAN_PERIOD = "2y"              
 
 market_cap_cache = {}
 
 def load_brain():
     brain = {
         "min_breakout_close_strength": 0.55,
-        "min_rs_65": 0.03,
-        "max_dist_from_52w_high_normal": 0.45,   
-        "max_dist_from_52w_high_below_150": 0.50, 
+        "min_rs_65": 0.05, # הועלה מ-0.03 ל-0.05 כדי לחפש רק מניות חזקות מהשוק
+        "max_dist_from_52w_high_normal": 0.40,   
+        "max_dist_from_52w_high_below_150": 0.45, 
         "max_gap_above_pivot": 0.02,
         "max_entry_extension": 0.04,          
         "breakout_volume_ratio": 1.3,         
         "watchlist_volume_ratio": 0.75,
         "pivot_tolerance": 0.055,             
-        "max_risk_pct": 12.0,
+        "max_risk_pct": 10.0, # סיכון מקסימלי ירד ל-10% לעסקה מהודקת יותר
         "allow_unknown_market_cap": True,
         "min_atr_pct": 0.02,
         "min_touch_count": 2,
-        "watchlist_max_dist": 0.07,
+        "watchlist_max_dist": 0.05, # מעקב רק מ-5% ומעלה
     }
     try:
         if os.path.exists("brain.json"):
@@ -67,9 +67,13 @@ def append_dataframe(df, file_path):
         pass
 
 def send_telegram(message):
-    print("\n" + "="*25)
-    print("שולח הודעה מסכמת לטלגרם...")
-    print("="*25 + "\n")
+    # ✅ הוסף כאן - ההדפסה הזו תמיד תופיע בגיטהאב, גם אם אין טלגרם מוגדר!
+    print("\n" + "="*50)
+    print("תוצאות הסריקה הסופיות (נשלחות לטלגרם / מוצגות למסך):")
+    print("="*50)
+    print(message)
+    print("="*50 + "\n")
+    
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -167,7 +171,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות קלאסיות (מבוסס מבנה)
+# 4. מנוע זיהוי תבניות קלאסיות (נוקשה בהרבה!)
 # ==========================================
 def calculate_dry_up(vols, base_start, base_end):
     base_vol = np.mean(vols[base_start:base_end]) if base_end > base_start else 1
@@ -177,21 +181,18 @@ def calculate_dry_up(vols, base_start, base_end):
 def get_cup_and_handle(highs, lows, vols, closes, n):
     if n < 60: return None
     
-    # 1. השפה השמאלית
     recent_highs = highs[-100:-10]
     if len(recent_highs) == 0: return None
     left_lip_idx = int(np.argmax(recent_highs))
     left_lip_val = float(recent_highs[left_lip_idx])
     
-    # 2. תחתית הכוס
     if left_lip_idx > len(recent_highs) - 15: return None 
     cup_low_idx = left_lip_idx + int(np.argmin(lows[left_lip_idx: -5]))
     cup_low_val = float(lows[cup_low_idx])
     
     cup_depth = (left_lip_val - cup_low_val) / left_lip_val
-    if cup_depth < 0.12 or cup_depth > 0.45: return None 
+    if cup_depth < 0.12 or cup_depth > 0.35: return None # עומק גג 35%
     
-    # 3. השפה הימנית
     right_side_highs = highs[cup_low_idx : -2]
     if len(right_side_highs) == 0: return None
     right_lip_idx = cup_low_idx + int(np.argmax(right_side_highs))
@@ -200,15 +201,14 @@ def get_cup_and_handle(highs, lows, vols, closes, n):
     if abs(left_lip_val - right_lip_val) / left_lip_val > 0.08: return None
     pivot = max(left_lip_val, right_lip_val)
     
-    # 4. הידית
     handle_len = (len(highs) - 1) - right_lip_idx
-    if handle_len < 3 or handle_len > 25: return None 
+    if handle_len < 3 or handle_len > 20: return None 
     
     handle_low = float(np.min(lows[right_lip_idx:]))
     handle_depth = (right_lip_val - handle_low) / right_lip_val
     
-    if handle_depth > cup_depth * 0.6: return None 
-    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.4: return None 
+    if handle_depth > cup_depth * 0.4: return None # ידית חייבת להיות רדודה משמעותית מהכוס
+    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.5: return None # ידית רק בחצי העליון!
     
     return {
         "type": "☕ Cup & Handle", "pivot_price": pivot, "tight_low": handle_low,
@@ -223,22 +223,22 @@ def get_bull_flag(highs, lows, vols, closes, n):
     if len(recent_30_highs) == 0: return None
     pole_peak_idx = int(np.argmax(recent_30_highs))
     
-    if pole_peak_idx < 5 or pole_peak_idx > 27: return None 
+    if pole_peak_idx < 4 or pole_peak_idx > 25: return None 
     
     pole_peak_val = float(recent_30_highs[pole_peak_idx])
     pole_start_val = float(np.min(lows[-30:-2][:pole_peak_idx+1]))
     
-    if (pole_peak_val - pole_start_val) / pole_start_val < 0.12: return None 
+    if (pole_peak_val - pole_start_val) / pole_start_val < 0.20: return None # תורן חייב להיות זינוק מטורף של לפחות 20%!
     
     flag_zone_lows = lows[-30:][pole_peak_idx+1:]
     if len(flag_zone_lows) == 0: return None
     flag_low = float(np.min(flag_zone_lows))
     
     flag_depth = (pole_peak_val - flag_low) / pole_peak_val
-    if flag_depth > 0.15: return None 
+    if flag_depth > 0.12: return None # הדגל יכול לתקן מקסימום 12% למטה
     
     current_close = float(closes[-1])
-    if current_close < flag_low + (pole_peak_val - flag_low) * 0.4: return None 
+    if current_close < flag_low + (pole_peak_val - flag_low) * 0.5: return None 
     
     return {
         "type": "🚩 Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low,
@@ -258,20 +258,21 @@ def get_darvas_box(highs, lows, vols, closes, n):
     box_bottom = float(np.min(window_lows))
 
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.04 or box_depth > 0.15: return None 
+    if box_depth < 0.04 or box_depth > 0.12: return None # קופסה רזה והדוקה יותר (מקסימום 12%)
 
+    # הקשחה מטורפת: דורש ש-85% מהזמן המניה תהיה קפואה במקום
     days_in_box = np.sum((window_closes >= box_bottom * 0.98) & (window_closes <= box_top * 1.02))
-    if (days_in_box / len(window_closes)) < 0.70: return None 
+    if (days_in_box / len(window_closes)) < 0.85: return None 
         
-    top_touches = np.where(window_highs >= box_top * 0.975)[0]
+    top_touches = np.where(window_highs >= box_top * 0.985)[0]
     if len(top_touches) < 2: return None
-    if top_touches[-1] - top_touches[0] < 10: return None 
+    if top_touches[-1] - top_touches[0] < 12: return None 
 
     pre_box_close = float(closes[-(box_length + 20)])
-    if pre_box_close >= box_bottom * 0.95: return None 
+    if pre_box_close >= box_bottom * 0.93: return None 
 
     current_close = float(closes[-1])
-    if current_close < box_bottom + (box_top - box_bottom) * 0.65: return None 
+    if current_close < box_bottom + (box_top - box_bottom) * 0.75: return None # חייבת לשבת דבוקה לתקרה
 
     box_vol = np.mean(vols[-box_length:-5])
     recent_vol = np.mean(vols[-5:])
@@ -301,10 +302,10 @@ def get_double_bottom(highs, lows, vols, n):
     right_bottom_idx = mid_peak_idx + int(np.argmin(right_section))
     right_bottom_val = float(lows[right_bottom_idx])
     
-    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.05: return None
+    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.04: return None
     
     base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / mid_peak_val
-    if base_depth < 0.10: return None
+    if base_depth < 0.10 or base_depth > 0.30: return None
     
     pivot = mid_peak_val
     handle_low = float(np.min(lows[right_bottom_idx:]))
@@ -398,7 +399,8 @@ def scan_market():
             pivot = float(pattern["pivot_price"])
             dist_to_pivot = (close / pivot) - 1.0
 
-            if dist_to_pivot < -0.15 or dist_to_pivot > 0.05: continue
+            # 🚨 המסנן שהורג 90% מהרעש: המניה חייבת להיות בטווח של -6% עד +3% מהפיבוט בלבד! 🚨
+            if dist_to_pivot < -0.06 or dist_to_pivot > 0.03: continue
             stats["pass_pivot_dist"] += 1 
 
             vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if float(today["Vol_50"]) > 0 else 0.0
@@ -440,7 +442,7 @@ def scan_market():
         except Exception as e: 
             print(f"\n⚠️ שגיאה בסימול {ticker}: {e}")
 
-    # הדפסות של מערכת הסינון מועברות לקונסול בלבד:
+    # הדפסות של מערכת הסינון:
     print("\n\n--- 📊 דוח סינון סריקה יומית 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
@@ -451,7 +453,7 @@ def scan_market():
 
     final_selection = (prime + bench)[:TOP_RESULTS]
     if not final_selection:
-        send_telegram("✅ הסריקה הקלאסית הסתיימה. אין פריצות או תבניות קלאסיות חדשות.")
+        send_telegram("✅ הסריקה הקלאסית הסתיימה. אין פריצות או תבניות קלאסיות חדשות בטווח הפריצה.")
         return
 
     msg = "🎯 <b>סריקת תבניות קלאסיות יומית!</b>\n"
