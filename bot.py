@@ -171,7 +171,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות קלאסיות (נוקשה בהרבה!)
+# 4. מנוע זיהוי תבניות קלאסיות (זמנים גמישים פרופורציונלית!)
 # ==========================================
 def calculate_dry_up(vols, base_start, base_end):
     base_vol = np.mean(vols[base_start:base_end]) if base_end > base_start else 1
@@ -181,34 +181,38 @@ def calculate_dry_up(vols, base_start, base_end):
 def get_cup_and_handle(highs, lows, vols, closes, n):
     if n < 60: return None
     
-    recent_highs = highs[-100:-10]
+    # 1. השפה השמאלית יכולה להיות בכל נקודה בשנתיים האחרונות (עד 20 יום אחורה)
+    recent_highs = highs[:-20]
     if len(recent_highs) == 0: return None
     left_lip_idx = int(np.argmax(recent_highs))
     left_lip_val = float(recent_highs[left_lip_idx])
     
-    if left_lip_idx > len(recent_highs) - 15: return None 
+    # 2. תחתית הכוס
+    if left_lip_idx > len(recent_highs) - 10: return None 
     cup_low_idx = left_lip_idx + int(np.argmin(lows[left_lip_idx: -5]))
     cup_low_val = float(lows[cup_low_idx])
     
     cup_depth = (left_lip_val - cup_low_val) / left_lip_val
-    if cup_depth < 0.12 or cup_depth > 0.35: return None # עומק גג 35%
+    if cup_depth < 0.12 or cup_depth > 0.45: return None # עומק סביר לכוס
     
+    # 3. השפה הימנית
     right_side_highs = highs[cup_low_idx : -2]
     if len(right_side_highs) == 0: return None
     right_lip_idx = cup_low_idx + int(np.argmax(right_side_highs))
     right_lip_val = float(highs[right_lip_idx])
     
-    if abs(left_lip_val - right_lip_val) / left_lip_val > 0.08: return None
+    if abs(left_lip_val - right_lip_val) / left_lip_val > 0.12: return None # גמישות של 12% הבדל בין השפות
     pivot = max(left_lip_val, right_lip_val)
     
+    # 4. הידית - יכולה לקחת מ-3 ימים ועד 60 ימים (כ-3 חודשים)!
     handle_len = (len(highs) - 1) - right_lip_idx
-    if handle_len < 3 or handle_len > 20: return None 
+    if handle_len < 3 or handle_len > 60: return None 
     
     handle_low = float(np.min(lows[right_lip_idx:]))
     handle_depth = (right_lip_val - handle_low) / right_lip_val
     
-    if handle_depth > cup_depth * 0.4: return None # ידית חייבת להיות רדודה משמעותית מהכוס
-    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.5: return None # ידית רק בחצי העליון!
+    if handle_depth > cup_depth * 0.5: return None # הידית חייבת להיות רדודה ביחס לכוס (עד 50% ממנה)
+    if handle_low < cup_low_val + (pivot - cup_low_val) * 0.4: return None # רק בחצי העליון של המבנה
     
     return {
         "type": "☕ Cup & Handle", "pivot_price": pivot, "tight_low": handle_low,
@@ -217,33 +221,43 @@ def get_cup_and_handle(highs, lows, vols, closes, n):
     }
 
 def get_bull_flag(highs, lows, vols, closes, n):
-    if n < 30: return None
+    if n < 40: return None
     
-    recent_30_highs = highs[-30:-2]
-    if len(recent_30_highs) == 0: return None
-    pole_peak_idx = int(np.argmax(recent_30_highs))
+    # חיפוש שיא התורן: יכול לקרות מתישהו ב-90 ימי המסחר האחרונים (כ-4 חודשים!)
+    search_window = highs[-90:-4] 
+    if len(search_window) == 0: return None
     
-    if pole_peak_idx < 4 or pole_peak_idx > 25: return None 
+    pole_peak_idx_local = int(np.argmax(search_window))
+    absolute_peak_idx = (n - 90) + pole_peak_idx_local
+    pole_peak_val = float(highs[absolute_peak_idx])
     
-    pole_peak_val = float(recent_30_highs[pole_peak_idx])
-    pole_start_val = float(np.min(lows[-30:-2][:pole_peak_idx+1]))
+    # חיפוש תחילת המהלך: תורן יכול להיות ראלי של עד 40 ימי מסחר רצופים
+    start_search_idx = max(0, absolute_peak_idx - 40)
+    pole_start_val = float(np.min(lows[start_search_idx : absolute_peak_idx]))
     
-    if (pole_peak_val - pole_start_val) / pole_start_val < 0.20: return None # תורן חייב להיות זינוק מטורף של לפחות 20%!
+    if (pole_peak_val - pole_start_val) / pole_start_val < 0.18: return None # זינוק מהותי
     
-    flag_zone_lows = lows[-30:][pole_peak_idx+1:]
-    if len(flag_zone_lows) == 0: return None
-    flag_low = float(np.min(flag_zone_lows))
+    # זמן הדגל: בין 4 ימים ל-45 ימים של "עיכול" המחיר
+    flag_length = (n - 1) - absolute_peak_idx
+    if flag_length < 4 or flag_length > 45: return None 
+    
+    flag_lows = lows[absolute_peak_idx : -1]
+    if len(flag_lows) == 0: return None
+    flag_low = float(np.min(flag_lows))
     
     flag_depth = (pole_peak_val - flag_low) / pole_peak_val
-    if flag_depth > 0.12: return None # הדגל יכול לתקן מקסימום 12% למטה
+    if flag_depth < 0.03 or flag_depth > 0.20: return None # יכול לתקן עד 20% במקרים של דגלים ארוכים
+    
+    max_in_flag = float(np.max(highs[absolute_peak_idx+1 : -1]))
+    if max_in_flag > pole_peak_val * 1.01: return None # חוק הציפה - אסור לשבור את השיא באמצע הדגל
     
     current_close = float(closes[-1])
-    if current_close < flag_low + (pole_peak_val - flag_low) * 0.5: return None 
+    if current_close < flag_low + (pole_peak_val - flag_low) * 0.3: return None # חייב להתחיל להראות עליה חזרה
     
     return {
         "type": "🚩 Bull Flag", "pivot_price": pole_peak_val, "tight_low": flag_low,
         "last_pullback_low": flag_low, "tightness": flag_depth, "base_depth": flag_depth,
-        "dry_up_ratio": 1.0, "touches": 1, "base_length": (len(highs) - 1) - pole_peak_idx
+        "dry_up_ratio": 1.0, "touches": 1, "base_length": flag_length
     }
 
 def get_darvas_box(highs, lows, vols, closes, n):
@@ -258,9 +272,8 @@ def get_darvas_box(highs, lows, vols, closes, n):
     box_bottom = float(np.min(window_lows))
 
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.04 or box_depth > 0.12: return None # קופסה רזה והדוקה יותר (מקסימום 12%)
+    if box_depth < 0.04 or box_depth > 0.12: return None 
 
-    # הקשחה מטורפת: דורש ש-85% מהזמן המניה תהיה קפואה במקום
     days_in_box = np.sum((window_closes >= box_bottom * 0.98) & (window_closes <= box_top * 1.02))
     if (days_in_box / len(window_closes)) < 0.85: return None 
         
@@ -272,7 +285,7 @@ def get_darvas_box(highs, lows, vols, closes, n):
     if pre_box_close >= box_bottom * 0.93: return None 
 
     current_close = float(closes[-1])
-    if current_close < box_bottom + (box_top - box_bottom) * 0.75: return None # חייבת לשבת דבוקה לתקרה
+    if current_close < box_bottom + (box_top - box_bottom) * 0.75: return None 
 
     box_vol = np.mean(vols[-box_length:-5])
     recent_vol = np.mean(vols[-5:])
@@ -285,27 +298,28 @@ def get_darvas_box(highs, lows, vols, closes, n):
     }
 
 def get_double_bottom(highs, lows, vols, n):
-    if n < 80: return None
+    if n < 100: return None
     
-    recent_lows = lows[-60:-10]
+    # הרגל הראשונה יכולה לקרות הרחק בעבר (עד מעל לשנה אחורה)
+    recent_lows = lows[-300:-20]
     if len(recent_lows) == 0: return None
     left_bottom_idx = int(np.argmin(recent_lows))
     left_bottom_val = float(recent_lows[left_bottom_idx])
     
     mid_section = highs[left_bottom_idx : -5]
-    if len(mid_section) < 5: return None
+    if len(mid_section) < 10: return None
     mid_peak_idx = left_bottom_idx + int(np.argmax(mid_section))
     mid_peak_val = float(highs[mid_peak_idx])
     
     right_section = lows[mid_peak_idx : -1]
-    if len(right_section) < 3: return None
+    if len(right_section) < 5: return None
     right_bottom_idx = mid_peak_idx + int(np.argmin(right_section))
     right_bottom_val = float(lows[right_bottom_idx])
     
-    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.04: return None
+    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.08: return None # גמישות ברגליים
     
     base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / mid_peak_val
-    if base_depth < 0.10 or base_depth > 0.30: return None
+    if base_depth < 0.10 or base_depth > 0.40: return None # יכול להיות עמוק עד 40%
     
     pivot = mid_peak_val
     handle_low = float(np.min(lows[right_bottom_idx:]))
@@ -340,6 +354,7 @@ def check_classical_patterns(hist):
     if pattern: return pattern
 
     return None
+
 
 # ==========================================
 # 5. דירוג וסריקה
