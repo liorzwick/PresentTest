@@ -233,6 +233,7 @@ def get_bull_flag(highs, lows, vols, closes, n):
 def get_darvas_box(highs, lows, vols, closes, n):
     if n < 60: return None
 
+    # 1. מציאת התקרה ב-40 יום האחרונים
     window_highs = highs[-40:]
     top_idx_local = int(np.argmax(window_highs))
     top_idx = (n - 40) + top_idx_local
@@ -240,29 +241,44 @@ def get_darvas_box(highs, lows, vols, closes, n):
 
     days_since_top = (n - 1) - top_idx
 
-    if days_since_top < 15: return None
+    # קופסה דורשת זמן בנייה (לפחות 3 שבועות)
+    if days_since_top < 20: return None
 
+    # 2. מציאת הרצפה מאז התקרה
     lows_since_top = lows[top_idx:]
     box_bottom = float(np.min(lows_since_top))
 
+    # 🚨 הקשחת עומק: מקסימום 10%! (SKM הייתה כ-14.5% ולכן תיזרק)
     box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.04 or box_depth > 0.15: return None
+    if box_depth < 0.03 or box_depth > 0.10: return None
 
+    # 3. המניה חייבת להגיע מלמטה (Uptrend)
     pre_box_idx = max(0, top_idx - 20)
     if float(closes[pre_box_idx]) > box_bottom * 0.95: return None 
 
+    # 4. וידוא דשדוש: 85% מהזמן המחיר סגור בתוך הקופסה
     closes_since_top = closes[top_idx:]
     in_box = np.sum((closes_since_top >= box_bottom * 0.98) & (closes_since_top <= box_top * 1.02))
-    if in_box / len(closes_since_top) < 0.80: return None
+    if in_box / len(closes_since_top) < 0.85: return None
 
+    # 🚨 מבחן התנגדות: חייבים להיות לפחות 2 ימים נפרדים שבהם המניה חזרה ל-2% מהשיא!
+    # אם המניה עשתה צורת V או U (כמו SKM), היא לא תעבור את זה.
+    top_tolerance = box_top * 0.98
+    top_test_days = np.where(highs[top_idx:] >= top_tolerance)[0]
+    if len(top_test_days) < 2: return None
+    # נדרש לפחות שבוע וחצי בין הבדיקות של התקרה
+    if top_test_days[-1] - top_test_days[0] < 10: return None
+
+    # 5. מוכנות לפריצה
     current_close = float(closes[-1])
-    if current_close < box_bottom + (box_top - box_bottom) * 0.70: return None
+    if current_close < box_bottom + (box_top - box_bottom) * 0.75: return None
 
     return {
         "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
         "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
-        "dry_up_ratio": 1.0, "touches": 2, "base_length": days_since_top
+        "dry_up_ratio": 1.0, "touches": len(top_test_days), "base_length": days_since_top
     }
+
 
 def get_cup_and_handle(highs, lows, vols, closes, n):
     if n < 150: return None
