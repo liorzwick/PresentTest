@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -9,13 +8,18 @@ import json
 from datetime import datetime
 import warnings
 
+# ייבוא ספריות הראייה הממוחשבת/השוואת צורות
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
+
 warnings.filterwarnings("ignore")
 
 # ==========================================
 # 1. הגדרות כלליות
 # ==========================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "") 
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP", "") 
+
 CUSTOM_TICKERS_FILE = "mystock.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
@@ -30,19 +34,19 @@ market_cap_cache = {}
 def load_brain():
     brain = {
         "min_breakout_close_strength": 0.55,
-        "min_rs_65": 0.05, # הועלה מ-0.03 ל-0.05 כדי לחפש רק מניות חזקות מהשוק
-        "max_dist_from_52w_high_normal": 0.40,   
-        "max_dist_from_52w_high_below_150": 0.45, 
+        "min_rs_65": 0.03,
+        "max_dist_from_52w_high_normal": 0.45,   
+        "max_dist_from_52w_high_below_150": 0.50, 
         "max_gap_above_pivot": 0.02,
         "max_entry_extension": 0.04,          
         "breakout_volume_ratio": 1.3,         
         "watchlist_volume_ratio": 0.75,
         "pivot_tolerance": 0.055,             
-        "max_risk_pct": 10.0, # סיכון מקסימלי ירד ל-10% לעסקה מהודקת יותר
+        "max_risk_pct": 12.0,
         "allow_unknown_market_cap": True,
         "min_atr_pct": 0.02,
         "min_touch_count": 2,
-        "watchlist_max_dist": 0.05, # מעקב רק מ-5% ומעלה
+        "watchlist_max_dist": 0.07,
     }
     try:
         if os.path.exists("brain.json"):
@@ -67,13 +71,9 @@ def append_dataframe(df, file_path):
         pass
 
 def send_telegram(message):
-    # ✅ הוסף כאן - ההדפסה הזו תמיד תופיע בגיטהאב, גם אם אין טלגרם מוגדר!
-    print("\n" + "="*50)
-    print("תוצאות הסריקה הסופיות (נשלחות לטלגרם / מוצגות למסך):")
-    print("="*50)
-    print(message)
-    print("="*50 + "\n")
-    
+    print("\n" + "="*25)
+    print("שולח הודעה לטלגרם...")
+    print("="*25 + "\n")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -133,7 +133,7 @@ def load_tickers():
                 return sorted(list(set([t for t in tickers if t.replace("-", "").isalnum()])))
         except Exception:
             pass
-    return ["AAPL", "MSFT", "NVDA"]
+    return ["AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
 
 # ==========================================
 # 3. אינדיקטורים
@@ -171,223 +171,98 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות קלאסיות (אכזרי וקפדני)
+# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW)
 # ==========================================
-def calculate_dry_up(vols, base_start, base_end):
-    base_vol = np.mean(vols[base_start:base_end]) if base_end > base_start else 1
-    handle_vol = np.mean(vols[-5:])
-    return float(handle_vol / base_vol) if base_vol > 0 else 1.0
+def normalize_series(series):
+    """מנרמל את הנתונים לטווח של 0 עד 1 להשוואת צורות טהורה"""
+    series_array = np.array(series)
+    min_val = np.min(series_array)
+    max_val = np.max(series_array)
+    if max_val == min_val:
+        return np.zeros(len(series_array))
+    return (series_array - min_val) / (max_val - min_val)
 
-def get_bull_flag(highs, lows, vols, closes, n):
-    if n < 50: return None
-    
-    # 1. מציאת השיא המוחלט של ה-40 ימים האחרונים
-    recent_highs = highs[-40:]
-    peak_idx_local = int(np.argmax(recent_highs))
-    peak_idx = (n - 40) + peak_idx_local
-    peak_val = float(highs[peak_idx])
-    
-    # 2. זמן הדגל
-    days_since_peak = (n - 1) - peak_idx
-    
-    # 🚨 חוק זמן מחמיר: דגל חייב להיות בין 7 ל-30 ימי מסחר. 4 ימים זה מוקדם מדי.
-    if days_since_peak < 7 or days_since_peak > 30: return None
-    
-    # 3. התורן (Pole): חייב להיות זינוק אלים, לא עלייה איטית!
-    # בודקים רק את ה-15 ימים שלפני השיא.
-    pole_start_idx = max(0, peak_idx - 15)
-    pole_start_val = float(np.min(lows[pole_start_idx : peak_idx]))
-    
-    pole_run = (peak_val - pole_start_val) / pole_start_val
-    if pole_run < 0.25: return None # 🚨 חייב לפחות 25% עלייה ב-15 ימים!
-    
-    # 4. הדגל (Flag)
-    flag_highs = highs[peak_idx+1 : n]
-    flag_lows = lows[peak_idx+1 : n]
-    if len(flag_lows) == 0: return None
-    
-    flag_low = float(np.min(flag_lows))
-    
-    # אסור לאף נר בדגל לפרוץ את שיא התורן (אפילו לא קרוב, גג 98.5% מהשיא)
-    if float(np.max(flag_highs)) > peak_val * 0.985: return None
-    
-    flag_depth = (peak_val - flag_low) / peak_val
-    if flag_depth < 0.04 or flag_depth > 0.20: return None # הדגל חייב לתקן בין 4% ל-20%
-    
-    # 5. התייבשות מחזורים (Volume Dry-up) קריטית בדגל!
-    pole_vol = np.mean(vols[pole_start_idx : peak_idx+1])
-    flag_vol = np.mean(vols[peak_idx+1 : n])
-    if flag_vol > pole_vol * 0.70: return None # 🚨 המחזור בדגל חייב לחתוך לפחות ב-30% לעומת הזינוק
-    
-    current_close = float(closes[-1])
-    if current_close < flag_low + (peak_val - flag_low) * 0.4: return None 
-    
-    dry_up = float(flag_vol / pole_vol) if pole_vol > 0 else 1.0
+def get_dtw_templates():
+    """מייצר את הציורים האידאליים עבור כל התבניות (תבניות מתמטיות)"""
+    templates = {}
 
-    return {
-        "type": "🚩 Bull Flag", "pivot_price": peak_val, "tight_low": flag_low,
-        "last_pullback_low": flag_low, "tightness": flag_depth, "base_depth": flag_depth,
-        "dry_up_ratio": dry_up, "touches": 1, "base_length": days_since_peak
-    }
+    # 1. דגל שורי: זינוק מהיר, ירידה אלכסונית מתונה
+    pole = np.linspace(0, 1.0, 10)
+    flag = np.linspace(1.0, 0.8, 20)
+    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag)), "window": 30, "threshold": 2.5}
 
-def get_darvas_box(highs, lows, vols, closes, n):
-    if n < 80: return None
+    # 2. מלבן דרווס: זינוק, ודשדוש אופקי עם גלים קטנים
+    rise = np.linspace(0, 1.0, 15)
+    box = np.ones(35) * 0.95 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
+    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, box)), "window": 50, "threshold": 3.0}
 
-    box_length = 35 # אורך הקופסה לבדיקה (כחודש וחצי של מסחר)
+    # 3. תחתית כפולה (W): ירידה, עלייה קלה, ירידה, עלייה
+    l_drop = np.linspace(1, 0, 15)
+    m_up = np.linspace(0, 0.5, 15)
+    m_down = np.linspace(0.5, 0, 15)
+    r_up = np.linspace(0, 1, 15)
+    templates["🧲 תחתית כפולה"] = {"data": np.concatenate((l_drop, m_up, m_down, r_up)), "window": 60, "threshold": 3.5}
 
-    # מבודדים את חלון הזמן של הקופסה
-    window_highs = highs[-box_length:-2]
-    window_lows = lows[-box_length:-2]
-    window_closes = closes[-box_length:-2]
-    
-    box_top = float(np.max(window_highs))
-    box_bottom = float(np.min(window_lows))
+    # 4. ספל וידית: צורת U גדולה ואז ירידה קלה
+    x_cup = np.linspace(-1, 1, 75)
+    cup = x_cup**2  
+    handle = np.linspace(1.0, 0.7, 15) 
+    templates["☕ ספל וידית"] = {"data": np.concatenate((cup, handle)), "window": 90, "threshold": 4.0}
 
-    # 1. עומק הקופסה (מקסימום 15% התנודתיות המותרת)
-    box_depth = (box_top - box_bottom) / box_top
-    if box_depth < 0.03 or box_depth > 0.15: return None
+    return templates
 
-    # 2. הוכחת דשדוש אופקי טהור (הסוד של NXT!)
-    # אנחנו מוודאים ש-85% מהסגירות היו כלואות פיזית בתוך המלבן האופקי
-    in_box = np.sum((window_closes >= box_bottom * 0.98) & (window_closes <= box_top * 1.02))
-    if (in_box / len(window_closes)) < 0.85: return None
+def check_all_dtw_patterns(closes):
+    """רץ על כל התבניות האידאליות ומחזיר את ההתאמה הכי טובה (אם קיימת)"""
+    templates = get_dtw_templates()
+    best_pattern = None
+    best_score = float('inf')
 
-    # 3. הוכחת התנגדות בתקרה
-    top_tolerance = box_top * 0.98
-    top_touches = np.where(window_highs >= top_tolerance)[0]
-    if len(top_touches) < 2: return None
-    # חייב להיות מרחק של לפחות שבוע וחצי בין הנגיעות כדי להוכיח שזו תקרה מוצקה
-    if top_touches[-1] - top_touches[0] < 10: return None 
-
-    # 4. הוכחת תמיכה ברצפה (מונע מצב של משולש מתכנס, מוודא שזה מלבן)
-    bottom_tolerance = box_bottom * 1.02
-    bottom_touches = np.where(window_lows <= bottom_tolerance)[0]
-    if len(bottom_touches) < 2: return None
-
-    # 5. מגמה ארוכת טווח: במקום לפסול בגלל ספייק קרוב, מוודאים שכללית המניה במגמת עלייה מחצי השנה האחרונה
-    if float(closes[-80]) > box_top * 1.05: return None 
-
-    # 6. מוכנות לפריצה: חייבת להימצא כרגע ב-35% העליונים של הקופסה
-    current_close = float(closes[-1])
-    if current_close < box_bottom + (box_top - box_bottom) * 0.65: return None
-
-    # התייבשות מחזורים
-    box_vol = np.mean(vols[-box_length:-5])
-    recent_vol = np.mean(vols[-5:])
-    dry_up = recent_vol / box_vol if box_vol > 0 else 1.0
-
-    return {
-        "type": "📦 Darvas Box", "pivot_price": box_top, "tight_low": box_bottom,
-        "last_pullback_low": box_bottom, "tightness": box_depth, "base_depth": box_depth,
-        "dry_up_ratio": dry_up, "touches": len(top_touches), "base_length": box_length
-    }
-
-
-
-def get_cup_and_handle(highs, lows, vols, closes, n):
-    if n < 150: return None
-
-    left_lip_idx_local = int(np.argmax(highs[-150:]))
-    left_lip_idx = (n - 150) + left_lip_idx_local
-    
-    days_since_left_lip = (n - 1) - left_lip_idx
-    if days_since_left_lip < 40: return None 
-    
-    left_lip_val = float(highs[left_lip_idx])
-
-    cup_low_idx_local = int(np.argmin(lows[left_lip_idx:]))
-    cup_low_idx = left_lip_idx + cup_low_idx_local
-    cup_low_val = float(lows[cup_low_idx])
-
-    cup_depth = (left_lip_val - cup_low_val) / left_lip_val
-    if cup_depth < 0.12 or cup_depth > 0.45: return None
-
-    right_lip_idx_local = int(np.argmax(highs[cup_low_idx:]))
-    right_lip_idx = cup_low_idx + right_lip_idx_local
-    right_lip_val = float(highs[right_lip_idx])
-
-    if abs(left_lip_val - right_lip_val) / left_lip_val > 0.12: return None
-
-    days_since_right_lip = (n - 1) - right_lip_idx
-    if days_since_right_lip < 4 or days_since_right_lip > 35: return None
-
-    handle_low = float(np.min(lows[right_lip_idx:]))
-    handle_depth = (right_lip_val - handle_low) / right_lip_val
-
-    if handle_depth > cup_depth * 0.5: return None
-    if float(closes[-1]) < cup_low_val + (right_lip_val - cup_low_val) * 0.5: return None
-
-    pivot = max(left_lip_val, right_lip_val)
-    
-    return {
-        "type": "☕ Cup & Handle", "pivot_price": pivot, "tight_low": handle_low,
-        "last_pullback_low": handle_low, "tightness": handle_depth, "base_depth": cup_depth,
-        "dry_up_ratio": calculate_dry_up(vols, left_lip_idx, right_lip_idx), "touches": 2, "base_length": days_since_left_lip
-    }
-
-def get_double_bottom(highs, lows, vols, closes, n):
-    if n < 150: return None
-
-    recent_lows = lows[-150:]
-    left_bottom_idx_local = int(np.argmin(recent_lows))
-    left_bottom_idx = (n - 150) + left_bottom_idx_local
-
-    days_since_left = (n - 1) - left_bottom_idx
-    if days_since_left < 30: return None
-
-    mid_peak_idx_local = int(np.argmax(highs[left_bottom_idx:]))
-    mid_peak_idx = left_bottom_idx + mid_peak_idx_local
-    mid_peak_val = float(highs[mid_peak_idx])
-
-    if mid_peak_idx == (n - 1): return None
-
-    right_bottom_idx_local = int(np.argmin(lows[mid_peak_idx:]))
-    right_bottom_idx = mid_peak_idx + right_bottom_idx_local
-    right_bottom_val = float(lows[right_bottom_idx])
-    left_bottom_val = float(lows[left_bottom_idx])
-
-    if abs(left_bottom_val - right_bottom_val) / left_bottom_val > 0.08: return None
-
-    base_depth = (mid_peak_val - min(left_bottom_val, right_bottom_val)) / mid_peak_val
-    if base_depth < 0.10 or base_depth > 0.40: return None
-
-    days_since_right = (n - 1) - right_bottom_idx
-    if days_since_right < 3: return None
-
-    pivot = mid_peak_val
-    if float(closes[-1]) < right_bottom_val + (mid_peak_val - right_bottom_val) * 0.5: return None
-
-    handle_low = float(np.min(lows[right_bottom_idx:]))
-    
-    return {
-        "type": "🧲 Double Bottom", "pivot_price": pivot, "tight_low": handle_low,
-        "last_pullback_low": handle_low, "tightness": (pivot - handle_low)/pivot, "base_depth": base_depth,
-        "dry_up_ratio": 1.0, "touches": 2, "base_length": right_bottom_idx - left_bottom_idx
-    }
-
-def check_classical_patterns(hist):
-    hist_filtered = hist.dropna(subset=['High', 'Low', 'Volume', 'Close'])
-    if len(hist_filtered) < 60: return None
-
-    highs = hist_filtered["High"].astype(float).values
-    lows = hist_filtered["Low"].astype(float).values
-    vols = hist_filtered["Volume"].astype(float).values
-    closes = hist_filtered["Close"].astype(float).values
-    n = len(hist_filtered)
-
-    pattern = get_bull_flag(highs, lows, vols, closes, n)
-    if pattern: return pattern
-
-    pattern = get_cup_and_handle(highs, lows, vols, closes, n)
-    if pattern: return pattern
-
-    pattern = get_double_bottom(highs, lows, vols, closes, n)
-    if pattern: return pattern
-
-    pattern = get_darvas_box(highs, lows, vols, closes, n)
-    if pattern: return pattern
-
-    return None
+    for name, config in templates.items():
+        window = config["window"]
+        if len(closes) < window:
+            continue
+        
+        current_closes = closes[-window:]
+        norm_current = normalize_series(current_closes)
+        norm_template = normalize_series(config["data"])
+        
+        # חישוב מרחק DTW (ככל שנמוך יותר - הצורה יותר דומה)
+        distance, path = fastdtw(norm_current, norm_template, dist=euclidean)
+        
+        if distance < config["threshold"] and distance < best_score:
+            best_score = distance
+            
+            # זיהוי פיבוטים בהתאם לסוג התבנית
+            if "דגל" in name:
+                pivot = float(np.max(current_closes[-20:]))
+                low = float(np.min(current_closes[-20:]))
+            elif "דרווס" in name:
+                pivot = float(np.max(current_closes[-35:]))
+                low = float(np.min(current_closes[-35:]))
+            elif "תחתית" in name:
+                pivot = float(np.max(current_closes[15:45])) # שיא ה-W האמצעי
+                low = float(np.min(current_closes[-15:]))
+            else: # ספל וידית
+                pivot = float(np.max(current_closes[-20:])) 
+                low = float(np.min(current_closes[-15:]))
+            
+            tightness = (pivot - low) / pivot if pivot > 0 else 0
+            
+            best_pattern = {
+                "type": f"{name} (DTW)",
+                "dtw_distance": round(distance, 2),
+                "threshold": config["threshold"],
+                "pivot_price": pivot,
+                "tight_low": low,
+                "last_pullback_low": low,
+                "tightness": tightness,
+                "base_depth": 0.20,
+                "dry_up_ratio": 1.0, # מנוע הראייה לא משתמש במחזורים לאימות הצורה
+                "touches": 2,
+                "base_length": window
+            }
+            
+    return best_pattern
 
 # ==========================================
 # 5. דירוג וסריקה
@@ -395,16 +270,20 @@ def check_classical_patterns(hist):
 def calc_setup_score(alert):
     rs_score = min(max(alert["rs_65"], 0) * 250, 25)
     tight_score = max(0, (1 - min(alert["tightness"], 0.10) / 0.10) * 20)
-    dryup_score = max(0, (1 - min(alert["dry_up_ratio"], 1.0)) * 20)
     pivot_score = max(0, (1 - min(abs(alert["dist_to_pivot"]), 0.03) / 0.03) * 15)
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
+    
+    # הציון הויזואלי: ככל שהמרחק רחוק יותר מהסף, התבנית יפה יותר (מקבלת יותר ניקוד)
+    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 5)
+        
     bonus = 5 if not alert["is_below_150"] else 0
-    return round(rs_score + tight_score + dryup_score + pivot_score + close_score + volume_score + bonus, 1)
+    
+    return round(rs_score + tight_score + pivot_score + close_score + volume_score + dtw_score + bonus, 1)
 
 def scan_market():
     tickers = load_tickers()
-    print(f"✅ נטענו {len(tickers)} מניות לסריקה מתוך הקובץ.")
+    print(f"✅ נטענו {len(tickers)} מניות לסריקה.")
     if not tickers: return
 
     spy = get_spy_data()
@@ -425,10 +304,9 @@ def scan_market():
 
             if any(pd.isna(today[c]) for c in ["SMA_50", "SMA_150", "SMA_200", "ATR_14", "ATR_Pct"]): continue
 
-            close, open_price = float(today["Close"]), float(today["Open"])
+            close = float(today["Close"])
             if close < MIN_PRICE or float(today["DollarVol_50"]) < MIN_DOLLAR_VOL_50: continue
             if close <= float(today["SMA_50"]): continue
-
             if float(today["ATR_Pct"]) < BRAIN["min_atr_pct"]: continue
 
             stats["pass_basic"] += 1
@@ -440,15 +318,21 @@ def scan_market():
             stock_rs = float(today["ROC_65"]) - float(spy_rs)
             if stock_rs < BRAIN["min_rs_65"]: continue
 
-            pattern = check_classical_patterns(past_data)
+            past_filtered = past_data.dropna(subset=['Close'])
+            if len(past_filtered) < 30: continue
+            
+            closes = past_filtered["Close"].astype(float).values
+
+            # --- הלב של הסורק החדש: בודק ויזואלית מול כל התבניות במקביל ---
+            pattern = check_all_dtw_patterns(closes)
+
             if not pattern: continue
             stats["pass_pattern"] += 1
 
             pivot = float(pattern["pivot_price"])
             dist_to_pivot = (close / pivot) - 1.0
 
-            # 🚨 המסנן שהורג 90% מהרעש: המניה חייבת להיות בטווח של -6% עד +3% מהפיבוט בלבד! 🚨
-            if dist_to_pivot < -0.06 or dist_to_pivot > 0.03: continue
+            if dist_to_pivot < -0.15 or dist_to_pivot > 0.05: continue
             stats["pass_pivot_dist"] += 1 
 
             vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if float(today["Vol_50"]) > 0 else 0.0
@@ -481,31 +365,33 @@ def scan_market():
                 "dist_to_pivot": dist_to_pivot, "tightness": float(pattern["tightness"]),
                 "is_below_150": is_below_150, "dry_up_ratio": float(pattern["dry_up_ratio"]),
                 "touches": int(pattern["touches"]), "base_depth": float(pattern["base_depth"]),
-                "base_length": int(pattern["base_length"])
+                "base_length": int(pattern["base_length"]),
+                "dtw_distance": float(pattern["dtw_distance"]),
+                "threshold": float(pattern["threshold"])
             }
+                
             alert_data["setup_score"] = calc_setup_score(alert_data)
             all_potentials.append(alert_data)
             stats["final_approved"] += 1
 
         except Exception as e: 
-            print(f"\n⚠️ שגיאה בסימול {ticker}: {e}")
+            pass
 
-    # הדפסות של מערכת הסינון:
-    print("\n\n--- 📊 דוח סינון סריקה יומית 📊 ---")
+    print("\n--- 📊 דוח סינון ראייה ממוחשבת (DTW) 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
-    print("----------------------------------\n")
+    print("------------------------------------------\n")
 
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
 
     final_selection = (prime + bench)[:TOP_RESULTS]
     if not final_selection:
-        send_telegram("✅ הסריקה הקלאסית הסתיימה. אין פריצות או תבניות קלאסיות חדשות בטווח הפריצה.")
+        send_telegram("✅ הסריקה הסתיימה. לא נמצאו תבניות ויזואליות מתאימות כרגע.")
         return
 
-    msg = "🎯 <b>סריקת תבניות קלאסיות יומית!</b>\n"
-    msg += f"<i>(מציג עד {TOP_RESULTS} מניות מובחרות, מסודרות לפי תבניות טכניות)</i>\n\n"
+    msg = "🎯 <b>סריקת ראייה ממוחשבת יומית!</b>\n"
+    msg += f"<i>(מציג עד {TOP_RESULTS} מניות שזוהו באמצעות התאמת צורה DTW)</i>\n\n"
 
     pattern_groups = {}
     for s in final_selection:
@@ -514,8 +400,8 @@ def scan_market():
         pattern_groups[ptype].append(s)
 
     for ptype, stocks in pattern_groups.items():
-        icon = ptype.split()[0]
-        pattern_name = ptype.replace(icon, "").strip()
+        icon = ptype.split()[0] if " " in ptype else "📈"
+        pattern_name = ptype.replace(icon, "").replace("(DTW)", "").strip()
         msg += f"────────────────\n"
         msg += f"{icon} <b>תבנית {pattern_name} ({len(stocks)} מניות):</b>\n\n"
 
@@ -524,7 +410,7 @@ def scan_market():
             clean_status = a['status'].replace(' (Watchlist)', '')
 
             msg += f"{status_icon} <b>{a['ticker']}</b> | סטטוס: {clean_status}\n"
-            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📐 <b>כיווץ:</b> {a['tightness'] * 100:.1f}%\n"
+            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📏 <b>דימיון למקור:</b> {a['dtw_distance']:.1f} / {a['threshold']}\n"
             msg += f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f} | 💵 <b>מחיר:</b> ${a['close']:.2f}\n"
             msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f}\n"
             msg += f"🔗 <a href='https://il.tradingview.com/chart/?symbol={a['ticker']}'>TradingView</a>\n\n"
