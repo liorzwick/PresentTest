@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP", "") 
 
-CUSTOM_TICKERS_FILE = "mystock.csv"
+CUSTOM_TICKERS_FILE = "my_stocks.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
 MIN_DOLLAR_VOL_50 = 15_000_000  
@@ -134,7 +134,7 @@ def load_tickers():
                 return sorted(list(set([t for t in tickers if t.replace("-", "").isalnum()])))
         except Exception:
             pass
-    # רשימת גיבוי אם אין קובץ
+    # רשימת גיבוי למקרה שאין קובץ
     return ["AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN", "PLTR", "AMD"]
 
 # ==========================================
@@ -173,7 +173,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - מציאותי!
+# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - שגיאה ממוצעת!
 # ==========================================
 def normalize_series(series):
     """מנרמל את הנתונים לטווח של 0 עד 1 להשוואת צורות טהורה"""
@@ -187,35 +187,37 @@ def normalize_series(series):
 def get_dtw_templates():
     """מייצר את הציורים האידאליים עבור כל התבניות (מעודכן למציאות של סוחרים)"""
     templates = {}
+    # Threshold עכשיו מייצג "אחוז שגיאה מותר בממוצע ליום"
+    # סף 0.25 (25% שגיאה) הוא מעולה כמקדם גמישות ראשוני להתחלה.
 
-    # 1. דגל שורי מציאותי: זינוק מהיר -> תיקון בגלים יורדים (שיאים יורדים)
+    # 1. דגל שורי
     pole = np.linspace(0, 1.0, 10)
     x_flag = np.linspace(0, 4*np.pi, 20)
     flag_trend = np.linspace(1.0, 0.7, 20)
     flag_waves = flag_trend + np.sin(x_flag) * 0.05 
-    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag_waves)), "window": 30, "threshold": 3.0}
+    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag_waves)), "window": 30, "threshold": 0.25}
 
-    # 2. מלבן דרווס מציאותי: עלייה -> תיקון -> התכנסות אופקית (בסיס)
+    # 2. מלבן דרווס
     rise = np.linspace(0, 1.0, 10)
     initial_pullback = np.linspace(1.0, 0.8, 5) 
     x_box = np.linspace(0, 6*np.pi, 35)
     box = np.ones(35) * 0.9 + np.sin(x_box) * 0.05
-    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, initial_pullback, box)), "window": 50, "threshold": 3.5}
+    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, initial_pullback, box)), "window": 50, "threshold": 0.25}
 
-    # 3. תחתית כפולה (W) מציאותית: רגל ימין קצת נמוכה יותר (Shakeout)
+    # 3. תחתית כפולה
     l_drop = np.linspace(1.0, 0.1, 15)  
     m_up = np.linspace(0.1, 0.6, 15)    
-    m_down = np.linspace(0.6, 0.0, 15)  # ניעור - יורד נמוך יותר
+    m_down = np.linspace(0.6, 0.0, 15)  
     r_up = np.linspace(0.0, 1.0, 15)    
-    templates["🧲 תחתית כפולה"] = {"data": np.concatenate((l_drop, m_up, m_down, r_up)), "window": 60, "threshold": 3.5}
+    templates["🧲 תחתית כפולה"] = {"data": np.concatenate((l_drop, m_up, m_down, r_up)), "window": 60, "threshold": 0.25}
 
-    # 4. ספל וידית מציאותי: צד שמאל ארוך ואיטי, צד ימין מהיר, ידית גלית יורדת
+    # 4. ספל וידית
     left_cup = np.linspace(-1, 0, 45)**2
     right_cup = np.linspace(0, 1, 20)**2
     x_handle = np.linspace(0, 2*np.pi, 15)
     handle_trend = np.linspace(1.0, 0.7, 15)
     handle_waves = handle_trend + np.cos(x_handle) * 0.03
-    templates["☕ ספל וידית"] = {"data": np.concatenate((left_cup, right_cup, handle_waves)), "window": 80, "threshold": 4.5}
+    templates["☕ ספל וידית"] = {"data": np.concatenate((left_cup, right_cup, handle_waves)), "window": 80, "threshold": 0.25}
 
     return templates
 
@@ -236,35 +238,38 @@ def check_all_dtw_patterns(closes):
         
         distance, path = fastdtw(norm_current, norm_template, dist=euclidean)
         
-        if distance < config["threshold"] and distance < best_score:
-            best_score = distance
+        # חישוב השגיאה הממוצעת ליום (פותר את בעיית הפסילה המצטברת)
+        avg_distance = distance / window
+        
+        if avg_distance < config["threshold"] and avg_distance < best_score:
+            best_score = avg_distance
             
-            # זיהוי פיבוטים חכם בהתאם לצורה הוויזואלית שהוגדרה
+            # זיהוי פיבוטים חכם בהתאם לצורה
             if "דגל" in name:
-                pivot = float(np.max(current_closes[:15])) # שיא התורן
+                pivot = float(np.max(current_closes[:15]))
                 low = float(np.min(current_closes[-20:]))
             elif "דרווס" in name:
-                pivot = float(np.max(current_closes[-35:])) # שיא אזור ההתכנסות
+                pivot = float(np.max(current_closes[-35:]))
                 low = float(np.min(current_closes[-35:]))
             elif "תחתית" in name:
-                pivot = float(np.max(current_closes[15:45])) # הפסגה האמצעית של ה-W
-                low = float(np.min(current_closes[-25:])) # תחתית הרגל השנייה
+                pivot = float(np.max(current_closes[15:45]))
+                low = float(np.min(current_closes[-25:]))
             else: # ספל וידית
-                pivot = float(np.max(current_closes[40:70])) # שיא השפה הימנית/שמאלית
-                low = float(np.min(current_closes[-20:])) # תחתית הידית
+                pivot = float(np.max(current_closes[40:70]))
+                low = float(np.min(current_closes[-20:]))
             
             tightness = (pivot - low) / pivot if pivot > 0 else 0
             
             best_pattern = {
                 "type": f"{name} (DTW)",
-                "dtw_distance": round(distance, 2),
+                "dtw_distance": round(avg_distance, 3),
                 "threshold": config["threshold"],
                 "pivot_price": pivot,
                 "tight_low": low,
                 "last_pullback_low": low,
                 "tightness": tightness,
                 "base_depth": 0.20,
-                "dry_up_ratio": 1.0, # סורק ראייה לא משתמש במחזורים
+                "dry_up_ratio": 1.0, 
                 "touches": 2,
                 "base_length": window
             }
@@ -281,8 +286,8 @@ def calc_setup_score(alert):
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
     
-    # ניקוד DTW: ככל שהמרחק מהסף קטן יותר = התבנית מדוייקת ויפה יותר
-    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 6)
+    # ניקוד DTW מעודכן לאחוזים: ככל שהשגיאה קטנה יותר מקבלים יותר ניקוד
+    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 100)
         
     bonus = 5 if not alert["is_below_150"] else 0
     
@@ -418,7 +423,7 @@ def scan_market():
             clean_status = a['status'].replace(' (Watchlist)', '')
 
             msg += f"{status_icon} <b>{a['ticker']}</b> | סטטוס: {clean_status}\n"
-            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📏 <b>איכות תבנית:</b> {a['dtw_distance']:.1f} / {a['threshold']}\n"
+            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📏 <b>שגיאה מצורה:</b> {a['dtw_distance']:.3f} / {a['threshold']}\n"
             msg += f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f} | 💵 <b>מחיר:</b> ${a['close']:.2f}\n"
             msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f}\n"
             msg += f"🔗 <a href='https://il.tradingview.com/chart/?symbol={a['ticker']}'>TradingView</a>\n\n"
