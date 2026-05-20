@@ -171,7 +171,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - צלף!
+# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW + קורלציה)
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -184,8 +184,7 @@ def normalize_series(series):
 def get_dtw_templates():
     templates = {}
     
-    # 📉 ירדנו ל-0.075! (רק 7.5% שגיאה בממוצע ליום)
-    strict_threshold = 0.075
+    strict_threshold = 0.085 # הרפיתי מעט את ה-DTW כי עכשיו יש לנו חומת מגן של קורלציה
 
     pole = np.linspace(0, 1.0, 10)
     x_flag = np.linspace(0, 4*np.pi, 20)
@@ -226,25 +225,36 @@ def check_all_dtw_patterns(closes):
             
             current_closes = closes[-window:]
             norm_current = normalize_series(current_closes)
-            norm_template = normalize_series(config["data"])
             
+            # --- חומת המגן החדשה: קורלציית פירסון ---
+            # אנחנו מותחים את התבנית שלנו בדיוק לאורך של המניה ומשווים
+            x_orig = np.linspace(0, 1, len(config["data"]))
+            x_new = np.linspace(0, 1, window)
+            resized_template = np.interp(x_new, x_orig, config["data"])
+            norm_template_resized = normalize_series(resized_template)
+            
+            # בדיקת קורלציה
+            corr = np.corrcoef(norm_current, norm_template_resized)[0, 1]
+            
+            # אם אין דימיון של לפחות 70% بصורה הבסיסית (ללא עיוות זמן) - נפסול!
+            if pd.isna(corr) or corr < 0.70:
+                continue
+            
+            # רק אם עבר את הקורלציה, ניתן ל-DTW למדוד את השגיאה המדויקת
+            norm_template = normalize_series(config["data"])
             distance, path = fastdtw(norm_current, norm_template, dist=lambda x, y: abs(x - y))
             avg_distance = distance / window
             
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 
-                # --- Sanity Checks (סינוני היגיון אנושי) ---
-                # מונע מהמתמטיקה לאשר צורות מעוותות מדי
+                # הגיון אנושי (Sanity Checks)
                 if "דגל" in name and current_closes[-1] <= current_closes[0] * 1.05:
-                    continue # סוף הדגל חייב להיות גבוה ב-5% לפחות מתחילת התורן
-                    
+                    continue 
                 if "דרווס" in name:
-                    # מלבן דרווס דורש התכנסות שקטה לקראת הסוף. נפסול אם יש תנודתיות של מעל 15% בקצה.
                     if (np.max(current_closes[-15:]) - np.min(current_closes[-15:])) / np.max(current_closes[-15:]) > 0.15:
                         continue
-                        
                 if ("ספל" in name or "תחתית" in name) and current_closes[-1] <= np.min(current_closes) * 1.05:
-                    continue # לא יכול להיות שסיימנו בקרקעית המוחלטת, חייב התרוממות מהשפל
+                    continue 
 
                 best_score = avg_distance
                 w = window
@@ -267,6 +277,7 @@ def check_all_dtw_patterns(closes):
                 best_pattern = {
                     "type": f"{name} (DTW)",
                     "dtw_distance": round(avg_distance, 3),
+                    "correlation": round(corr * 100, 1), # מוסיפים את הציון הוויזואלי
                     "threshold": config["threshold"],
                     "pivot_price": pivot,
                     "tight_low": low,
@@ -290,10 +301,13 @@ def calc_setup_score(alert):
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
     
-    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 150) # הגדלתי השפעה בגלל המספרים הקטנים
+    # עכשיו הציון משקלל גם את השגיאה של DTW וגם את אחוז הקורלציה!
+    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 50)
+    corr_score = max(0, (alert["correlation"] - 70) * 0.5) 
+    
     bonus = 5 if not alert["is_below_150"] else 0
     
-    return round(rs_score + tight_score + pivot_score + close_score + volume_score + dtw_score + bonus, 1)
+    return round(rs_score + tight_score + pivot_score + close_score + volume_score + dtw_score + corr_score + bonus, 1)
 
 def scan_market():
     tickers = load_tickers()
@@ -380,6 +394,7 @@ def scan_market():
                 "touches": int(pattern["touches"]), "base_depth": float(pattern["base_depth"]),
                 "base_length": int(pattern["base_length"]),
                 "dtw_distance": float(pattern["dtw_distance"]),
+                "correlation": float(pattern["correlation"]),
                 "threshold": float(pattern["threshold"])
             }
                 
@@ -390,17 +405,17 @@ def scan_market():
         except Exception as e: 
             pass
 
-    print("\n--- 📊 דוח סינון מולטי-טיים פריים (DTW - מחמיר) 📊 ---")
+    print("\n--- 📊 דוח סינון קורלציה וראייה ממוחשבת 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
-    print("----------------------------------------------------\n")
+    print("----------------------------------------------\n")
 
     if all_potentials:
         print("--- 📋 רשימת המניות שעברו את הסינון 📋 ---")
         sorted_all = sorted(all_potentials, key=lambda x: -x["setup_score"])
         for idx, s in enumerate(sorted_all, 1):
             clean_type = s['type'].replace(' (DTW)', '')
-            print(f"{idx}. {s['ticker']:<5} | תבנית: {clean_type:<15} | ציון: {s['setup_score']:<4.1f} | טווח: {s['base_length']} ימים | שגיאה: {s['dtw_distance']:.3f} | פיבוט: ${s['pivot']:.2f} | מחיר: ${s['close']:.2f}")
+            print(f"{idx}. {s['ticker']:<5} | תבנית: {clean_type:<15} | ציון: {s['setup_score']:<4.1f} | טווח: {s['base_length']} ימים | קורלציה: {s['correlation']}% | פיבוט: ${s['pivot']:.2f}")
         print("----------------------------------------------\n")
     else:
         print("לא נמצאו מניות העונות לקריטריונים.")
@@ -410,7 +425,7 @@ def scan_market():
 
     final_selection = (prime + bench)[:TOP_RESULTS]
     if not final_selection:
-        send_telegram("✅ הסריקה הסתיימה. הבוט הפך לקפדני, לא נמצאו תבניות מתאימות הפעם.")
+        send_telegram("✅ הסריקה הסתיימה. הבוט קפדני מאוד, לא נמצאו תבניות מדויקות היום.")
         return
 
     msg = "🎯 <b>סריקת ראייה ממוחשבת מרובת זמנים (DTW)!</b>\n"
@@ -433,9 +448,9 @@ def scan_market():
             clean_status = a['status'].replace(' (Watchlist)', '')
 
             msg += f"{status_icon} <b>{a['ticker']}</b> | סטטוס: {clean_status}\n"
-            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📅 <b>טווח:</b> {a['base_length']} ימים\n"
+            msg += f"⭐ <b>ציון מלא:</b> {a['setup_score']:.1f} | 📏 <b>דמיון:</b> {a['correlation']}%\n"
             msg += f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f} | 💵 <b>מחיר:</b> ${a['close']:.2f}\n"
-            msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f}\n"
+            msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f} | 📅 <b>טווח:</b> {a['base_length']} ימים\n"
             msg += f"🔗 <a href='https://il.tradingview.com/chart/?symbol={a['ticker']}'>TradingView</a>\n\n"
 
             save_to_smart_memory(a["ticker"], a["close"], a["stop_loss"], a["risk_pct"], a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"], a["tightness"], a["type"], a["status"], a["setup_score"], a["dry_up_ratio"], a["touches"])
