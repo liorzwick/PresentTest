@@ -75,6 +75,7 @@ def send_telegram(message):
     print("שולח הודעה לטלגרם...")
     print("="*25 + "\n")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ פרטי טלגרם חסרים, מדלג על שליחה.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -133,7 +134,8 @@ def load_tickers():
                 return sorted(list(set([t for t in tickers if t.replace("-", "").isalnum()])))
         except Exception:
             pass
-    return ["AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN"]
+    # רשימת גיבוי אם אין קובץ
+    return ["AAPL", "MSFT", "NVDA", "TSLA", "META", "AMZN", "PLTR", "AMD"]
 
 # ==========================================
 # 3. אינדיקטורים
@@ -171,7 +173,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW)
+# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - מציאותי!
 # ==========================================
 def normalize_series(series):
     """מנרמל את הנתונים לטווח של 0 עד 1 להשוואת צורות טהורה"""
@@ -183,36 +185,42 @@ def normalize_series(series):
     return (series_array - min_val) / (max_val - min_val)
 
 def get_dtw_templates():
-    """מייצר את הציורים האידאליים עבור כל התבניות (תבניות מתמטיות)"""
+    """מייצר את הציורים האידאליים עבור כל התבניות (מעודכן למציאות של סוחרים)"""
     templates = {}
 
-    # 1. דגל שורי: זינוק מהיר, ירידה אלכסונית מתונה
+    # 1. דגל שורי מציאותי: זינוק מהיר -> תיקון בגלים יורדים (שיאים יורדים)
     pole = np.linspace(0, 1.0, 10)
-    flag = np.linspace(1.0, 0.8, 20)
-    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag)), "window": 30, "threshold": 2.5}
+    x_flag = np.linspace(0, 4*np.pi, 20)
+    flag_trend = np.linspace(1.0, 0.7, 20)
+    flag_waves = flag_trend + np.sin(x_flag) * 0.05 
+    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag_waves)), "window": 30, "threshold": 3.0}
 
-    # 2. מלבן דרווס: זינוק, ודשדוש אופקי עם גלים קטנים
-    rise = np.linspace(0, 1.0, 15)
-    box = np.ones(35) * 0.95 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
-    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, box)), "window": 50, "threshold": 3.0}
+    # 2. מלבן דרווס מציאותי: עלייה -> תיקון -> התכנסות אופקית (בסיס)
+    rise = np.linspace(0, 1.0, 10)
+    initial_pullback = np.linspace(1.0, 0.8, 5) 
+    x_box = np.linspace(0, 6*np.pi, 35)
+    box = np.ones(35) * 0.9 + np.sin(x_box) * 0.05
+    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, initial_pullback, box)), "window": 50, "threshold": 3.5}
 
-    # 3. תחתית כפולה (W): ירידה, עלייה קלה, ירידה, עלייה
-    l_drop = np.linspace(1, 0, 15)
-    m_up = np.linspace(0, 0.5, 15)
-    m_down = np.linspace(0.5, 0, 15)
-    r_up = np.linspace(0, 1, 15)
+    # 3. תחתית כפולה (W) מציאותית: רגל ימין קצת נמוכה יותר (Shakeout)
+    l_drop = np.linspace(1.0, 0.1, 15)  
+    m_up = np.linspace(0.1, 0.6, 15)    
+    m_down = np.linspace(0.6, 0.0, 15)  # ניעור - יורד נמוך יותר
+    r_up = np.linspace(0.0, 1.0, 15)    
     templates["🧲 תחתית כפולה"] = {"data": np.concatenate((l_drop, m_up, m_down, r_up)), "window": 60, "threshold": 3.5}
 
-    # 4. ספל וידית: צורת U גדולה ואז ירידה קלה
-    x_cup = np.linspace(-1, 1, 75)
-    cup = x_cup**2  
-    handle = np.linspace(1.0, 0.7, 15) 
-    templates["☕ ספל וידית"] = {"data": np.concatenate((cup, handle)), "window": 90, "threshold": 4.0}
+    # 4. ספל וידית מציאותי: צד שמאל ארוך ואיטי, צד ימין מהיר, ידית גלית יורדת
+    left_cup = np.linspace(-1, 0, 45)**2
+    right_cup = np.linspace(0, 1, 20)**2
+    x_handle = np.linspace(0, 2*np.pi, 15)
+    handle_trend = np.linspace(1.0, 0.7, 15)
+    handle_waves = handle_trend + np.cos(x_handle) * 0.03
+    templates["☕ ספל וידית"] = {"data": np.concatenate((left_cup, right_cup, handle_waves)), "window": 80, "threshold": 4.5}
 
     return templates
 
 def check_all_dtw_patterns(closes):
-    """רץ על כל התבניות האידאליות ומחזיר את ההתאמה הכי טובה (אם קיימת)"""
+    """רץ על כל התבניות ומחזיר את ההתאמה בעלת הציון הטוב ביותר"""
     templates = get_dtw_templates()
     best_pattern = None
     best_score = float('inf')
@@ -226,25 +234,24 @@ def check_all_dtw_patterns(closes):
         norm_current = normalize_series(current_closes)
         norm_template = normalize_series(config["data"])
         
-        # חישוב מרחק DTW (ככל שנמוך יותר - הצורה יותר דומה)
         distance, path = fastdtw(norm_current, norm_template, dist=euclidean)
         
         if distance < config["threshold"] and distance < best_score:
             best_score = distance
             
-            # זיהוי פיבוטים בהתאם לסוג התבנית
+            # זיהוי פיבוטים חכם בהתאם לצורה הוויזואלית שהוגדרה
             if "דגל" in name:
-                pivot = float(np.max(current_closes[-20:]))
+                pivot = float(np.max(current_closes[:15])) # שיא התורן
                 low = float(np.min(current_closes[-20:]))
             elif "דרווס" in name:
-                pivot = float(np.max(current_closes[-35:]))
+                pivot = float(np.max(current_closes[-35:])) # שיא אזור ההתכנסות
                 low = float(np.min(current_closes[-35:]))
             elif "תחתית" in name:
-                pivot = float(np.max(current_closes[15:45])) # שיא ה-W האמצעי
-                low = float(np.min(current_closes[-15:]))
+                pivot = float(np.max(current_closes[15:45])) # הפסגה האמצעית של ה-W
+                low = float(np.min(current_closes[-25:])) # תחתית הרגל השנייה
             else: # ספל וידית
-                pivot = float(np.max(current_closes[-20:])) 
-                low = float(np.min(current_closes[-15:]))
+                pivot = float(np.max(current_closes[40:70])) # שיא השפה הימנית/שמאלית
+                low = float(np.min(current_closes[-20:])) # תחתית הידית
             
             tightness = (pivot - low) / pivot if pivot > 0 else 0
             
@@ -257,7 +264,7 @@ def check_all_dtw_patterns(closes):
                 "last_pullback_low": low,
                 "tightness": tightness,
                 "base_depth": 0.20,
-                "dry_up_ratio": 1.0, # מנוע הראייה לא משתמש במחזורים לאימות הצורה
+                "dry_up_ratio": 1.0, # סורק ראייה לא משתמש במחזורים
                 "touches": 2,
                 "base_length": window
             }
@@ -274,8 +281,8 @@ def calc_setup_score(alert):
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
     
-    # הציון הויזואלי: ככל שהמרחק רחוק יותר מהסף, התבנית יפה יותר (מקבלת יותר ניקוד)
-    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 5)
+    # ניקוד DTW: ככל שהמרחק מהסף קטן יותר = התבנית מדוייקת ויפה יותר
+    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 6)
         
     bonus = 5 if not alert["is_below_150"] else 0
     
@@ -323,7 +330,7 @@ def scan_market():
             
             closes = past_filtered["Close"].astype(float).values
 
-            # --- הלב של הסורק החדש: בודק ויזואלית מול כל התבניות במקביל ---
+            # --- הלב של הסורק החדש: סריקה ויזואלית טהורה ---
             pattern = check_all_dtw_patterns(closes)
 
             if not pattern: continue
@@ -332,6 +339,7 @@ def scan_market():
             pivot = float(pattern["pivot_price"])
             dist_to_pivot = (close / pivot) - 1.0
 
+            # סובלנות למרחק מהפיבוט
             if dist_to_pivot < -0.15 or dist_to_pivot > 0.05: continue
             stats["pass_pivot_dist"] += 1 
 
@@ -410,7 +418,7 @@ def scan_market():
             clean_status = a['status'].replace(' (Watchlist)', '')
 
             msg += f"{status_icon} <b>{a['ticker']}</b> | סטטוס: {clean_status}\n"
-            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📏 <b>דימיון למקור:</b> {a['dtw_distance']:.1f} / {a['threshold']}\n"
+            msg += f"⭐ <b>ציון:</b> {a['setup_score']:.1f} | 📏 <b>איכות תבנית:</b> {a['dtw_distance']:.1f} / {a['threshold']}\n"
             msg += f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f} | 💵 <b>מחיר:</b> ${a['close']:.2f}\n"
             msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f}\n"
             msg += f"🔗 <a href='https://il.tradingview.com/chart/?symbol={a['ticker']}'>TradingView</a>\n\n"
