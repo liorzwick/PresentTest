@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP", "") 
 
-CUSTOM_TICKERS_FILE = "mystock.csv"
+CUSTOM_TICKERS_FILE = "my_stocks.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
 MIN_DOLLAR_VOL_50 = 15_000_000  
@@ -171,7 +171,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - סף מהודק!
+# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - צלף!
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -184,8 +184,8 @@ def normalize_series(series):
 def get_dtw_templates():
     templates = {}
     
-    # שינוי משמעותי: Threshold ירד ל-0.18. ייתן לנו פי 10 פחות תוצאות, אבל הרבה יותר מדויקות.
-    strict_threshold = 0.18 
+    # 📉 ירדנו ל-0.075! (רק 7.5% שגיאה בממוצע ליום)
+    strict_threshold = 0.075
 
     pole = np.linspace(0, 1.0, 10)
     x_flag = np.linspace(0, 4*np.pi, 20)
@@ -229,10 +229,23 @@ def check_all_dtw_patterns(closes):
             norm_template = normalize_series(config["data"])
             
             distance, path = fastdtw(norm_current, norm_template, dist=lambda x, y: abs(x - y))
-            
             avg_distance = distance / window
             
             if avg_distance < config["threshold"] and avg_distance < best_score:
+                
+                # --- Sanity Checks (סינוני היגיון אנושי) ---
+                # מונע מהמתמטיקה לאשר צורות מעוותות מדי
+                if "דגל" in name and current_closes[-1] <= current_closes[0] * 1.05:
+                    continue # סוף הדגל חייב להיות גבוה ב-5% לפחות מתחילת התורן
+                    
+                if "דרווס" in name:
+                    # מלבן דרווס דורש התכנסות שקטה לקראת הסוף. נפסול אם יש תנודתיות של מעל 15% בקצה.
+                    if (np.max(current_closes[-15:]) - np.min(current_closes[-15:])) / np.max(current_closes[-15:]) > 0.15:
+                        continue
+                        
+                if ("ספל" in name or "תחתית" in name) and current_closes[-1] <= np.min(current_closes) * 1.05:
+                    continue # לא יכול להיות שסיימנו בקרקעית המוחלטת, חייב התרוממות מהשפל
+
                 best_score = avg_distance
                 w = window
                 
@@ -277,7 +290,7 @@ def calc_setup_score(alert):
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
     
-    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 100)
+    dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 150) # הגדלתי השפעה בגלל המספרים הקטנים
     bonus = 5 if not alert["is_below_150"] else 0
     
     return round(rs_score + tight_score + pivot_score + close_score + volume_score + dtw_score + bonus, 1)
@@ -377,13 +390,11 @@ def scan_market():
         except Exception as e: 
             pass
 
-    # --- הדפסת הסטטיסטיקות ---
-    print("\n--- 📊 דוח סינון מולטי-טיים פריים (DTW) 📊 ---")
+    print("\n--- 📊 דוח סינון מולטי-טיים פריים (DTW - מחמיר) 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
-    print("----------------------------------------------\n")
+    print("----------------------------------------------------\n")
 
-    # --- הדפסת רשימת המניות שנמצאו ללוגים של גיטהאב ---
     if all_potentials:
         print("--- 📋 רשימת המניות שעברו את הסינון 📋 ---")
         sorted_all = sorted(all_potentials, key=lambda x: -x["setup_score"])
@@ -399,7 +410,7 @@ def scan_market():
 
     final_selection = (prime + bench)[:TOP_RESULTS]
     if not final_selection:
-        send_telegram("✅ הסריקה הסתיימה. לא נמצאו תבניות ויזואליות מתאימות כרגע.")
+        send_telegram("✅ הסריקה הסתיימה. הבוט הפך לקפדני, לא נמצאו תבניות מתאימות הפעם.")
         return
 
     msg = "🎯 <b>סריקת ראייה ממוחשבת מרובת זמנים (DTW)!</b>\n"
