@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "") 
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GROUP", "") 
 
-CUSTOM_TICKERS_FILE = "mystock.csv"
+CUSTOM_TICKERS_FILE = "my_stocks.csv"
 
 MIN_MARKET_CAP = 2_000_000_000
 MIN_DOLLAR_VOL_50 = 15_000_000  
@@ -171,7 +171,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - Multi-Timeframe!
+# 4. מנוע זיהוי תבניות מבוסס ראייה (DTW) - סף מהודק!
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -184,34 +184,33 @@ def normalize_series(series):
 def get_dtw_templates():
     templates = {}
     
-    # 1. דגל שורי: נבדוק חלונות קצרים (15 ימים) עד בינוניים (60 ימים)
+    # שינוי משמעותי: Threshold ירד ל-0.18. ייתן לנו פי 10 פחות תוצאות, אבל הרבה יותר מדויקות.
+    strict_threshold = 0.18 
+
     pole = np.linspace(0, 1.0, 10)
     x_flag = np.linspace(0, 4*np.pi, 20)
     flag_trend = np.linspace(1.0, 0.7, 20)
     flag_waves = flag_trend + np.sin(x_flag) * 0.05 
-    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag_waves)), "windows": [20, 30, 45, 60], "threshold": 0.30}
+    templates["🚩 דגל שורי"] = {"data": np.concatenate((pole, flag_waves)), "windows": [20, 30, 45, 60], "threshold": strict_threshold}
 
-    # 2. מלבן דרווס: נבדוק חודשיים עד חצי שנה
     rise = np.linspace(0, 1.0, 10)
     initial_pullback = np.linspace(1.0, 0.8, 5) 
     x_box = np.linspace(0, 6*np.pi, 35)
     box = np.ones(35) * 0.9 + np.sin(x_box) * 0.05
-    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, initial_pullback, box)), "windows": [40, 60, 90, 120], "threshold": 0.30}
+    templates["📦 מלבן דרווס"] = {"data": np.concatenate((rise, initial_pullback, box)), "windows": [40, 60, 90, 120], "threshold": strict_threshold}
 
-    # 3. תחתית כפולה: 3 חודשים עד כמעט שנה
     l_drop = np.linspace(1.0, 0.1, 15)  
     m_up = np.linspace(0.1, 0.6, 15)    
     m_down = np.linspace(0.6, 0.0, 15)  
     r_up = np.linspace(0.0, 1.0, 15)    
-    templates["🧲 תחתית כפולה"] = {"data": np.concatenate((l_drop, m_up, m_down, r_up)), "windows": [50, 80, 120, 180], "threshold": 0.30}
+    templates["🧲 תחתית כפולה"] = {"data": np.concatenate((l_drop, m_up, m_down, r_up)), "windows": [50, 80, 120, 180], "threshold": strict_threshold}
 
-    # 4. ספל וידית: הכי מגוון - מחודש ועד שנה ויותר
     left_cup = np.linspace(-1, 0, 45)**2
     right_cup = np.linspace(0, 1, 20)**2
     x_handle = np.linspace(0, 2*np.pi, 15)
     handle_trend = np.linspace(1.0, 0.7, 15)
     handle_waves = handle_trend + np.cos(x_handle) * 0.03
-    templates["☕ ספל וידית"] = {"data": np.concatenate((left_cup, right_cup, handle_waves)), "windows": [60, 90, 150, 250], "threshold": 0.30}
+    templates["☕ ספל וידית"] = {"data": np.concatenate((left_cup, right_cup, handle_waves)), "windows": [60, 90, 150, 250], "threshold": strict_threshold}
 
     return templates
 
@@ -221,7 +220,6 @@ def check_all_dtw_patterns(closes):
     best_score = float('inf')
 
     for name, config in templates.items():
-        # לולאה שעוברת על כל אחד מפרקי הזמן האפשריים לתבנית זו
         for window in config["windows"]:
             if len(closes) < window:
                 continue
@@ -230,29 +228,26 @@ def check_all_dtw_patterns(closes):
             norm_current = normalize_series(current_closes)
             norm_template = normalize_series(config["data"])
             
-            # חישוב מרחק DTW פשוט ובטוח מקריסות
             distance, path = fastdtw(norm_current, norm_template, dist=lambda x, y: abs(x - y))
             
-            # שגיאה ממוצעת ליום בהתאם למסגרת הזמן הספציפית
             avg_distance = distance / window
             
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 best_score = avg_distance
                 w = window
                 
-                # מציאת הפיבוט בצורה יחסית/אחוזית לאורך הגרף, לא משנה איזה טווח בחרנו
                 if "דגל" in name:
-                    pivot = float(np.max(current_closes[:int(w*0.5)])) # הפיבוט הוא התורן (החצי הראשון)
-                    low = float(np.min(current_closes[-int(w*0.5):]))  # התחתית היא בדגל עצמו
+                    pivot = float(np.max(current_closes[:int(w*0.5)]))
+                    low = float(np.min(current_closes[-int(w*0.5):]))
                 elif "דרווס" in name:
-                    pivot = float(np.max(current_closes[-int(w*0.7):])) # שיא הדשדוש האחרון
+                    pivot = float(np.max(current_closes[-int(w*0.7):]))
                     low = float(np.min(current_closes[-int(w*0.7):]))
                 elif "תחתית" in name:
-                    pivot = float(np.max(current_closes[int(w*0.3):int(w*0.7)])) # הפיבוט הוא הגבעה באמצע ה-W
-                    low = float(np.min(current_closes[-int(w*0.4):])) # השפל הימני (הניעור)
-                else: # ספל וידית
-                    pivot = float(np.max(current_closes[int(w*0.6):int(w*0.9)])) # שיא ימין של הספל
-                    low = float(np.min(current_closes[-int(w*0.3):])) # תחתית הידית
+                    pivot = float(np.max(current_closes[int(w*0.3):int(w*0.7)]))
+                    low = float(np.min(current_closes[-int(w*0.4):]))
+                else: 
+                    pivot = float(np.max(current_closes[int(w*0.6):int(w*0.9)]))
+                    low = float(np.min(current_closes[-int(w*0.3):]))
                 
                 tightness = (pivot - low) / pivot if pivot > 0 else 0
                 
@@ -267,7 +262,7 @@ def check_all_dtw_patterns(closes):
                     "base_depth": 0.20,
                     "dry_up_ratio": 1.0, 
                     "touches": 2,
-                    "base_length": window # שומרים את מסגרת הזמן המנצחת!
+                    "base_length": window
                 }
                 
     return best_pattern
@@ -329,7 +324,6 @@ def scan_market():
             
             closes = past_filtered["Close"].astype(float).values
 
-            # --- הבוט עכשיו בודק 16 קומבינציות שונות של צורה מול חלון זמן בכל מניה! ---
             pattern = check_all_dtw_patterns(closes)
 
             if not pattern: continue
@@ -381,13 +375,24 @@ def scan_market():
             stats["final_approved"] += 1
 
         except Exception as e: 
-            print(f"\n⚠️ שגיאה ספציפית במניה {ticker}: {e}")
             pass
 
+    # --- הדפסת הסטטיסטיקות ---
     print("\n--- 📊 דוח סינון מולטי-טיים פריים (DTW) 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
     print("----------------------------------------------\n")
+
+    # --- הדפסת רשימת המניות שנמצאו ללוגים של גיטהאב ---
+    if all_potentials:
+        print("--- 📋 רשימת המניות שעברו את הסינון 📋 ---")
+        sorted_all = sorted(all_potentials, key=lambda x: -x["setup_score"])
+        for idx, s in enumerate(sorted_all, 1):
+            clean_type = s['type'].replace(' (DTW)', '')
+            print(f"{idx}. {s['ticker']:<5} | תבנית: {clean_type:<15} | ציון: {s['setup_score']:<4.1f} | טווח: {s['base_length']} ימים | שגיאה: {s['dtw_distance']:.3f} | פיבוט: ${s['pivot']:.2f} | מחיר: ${s['close']:.2f}")
+        print("----------------------------------------------\n")
+    else:
+        print("לא נמצאו מניות העונות לקריטריונים.")
 
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
