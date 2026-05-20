@@ -19,11 +19,11 @@ jobs:
       with:
         python-version: '3.10'
 
-    # 3. התקנת הספריות הדרושות
+    # 3. התקנת הספריות הדרושות (כולל ספריות הראייה הממוחשבת)
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install yfinance pandas numpy requests
+        pip install yfinance pandas numpy requests fastdtw scipy
 
     # 4. הרצת קוד המעבדה (ללא צורך בטלגרם או שמירת נתונים)
     - name: Run Test Bot
