@@ -179,41 +179,39 @@ def normalize_series(series):
 
 def get_dtw_templates():
     templates = {}
-    
-    # שינוי: הוספת complexity_bonus. דגל = 0, ספל/תחתית = 2.
-    # שינוי: min_corr שונה לכל תבנית. לדגל נדרוש 88% התאמה!
-    
+
+    # -------------------------------------------------------
+    # תיקון #3: חלון מינימום של דגל הועלה מ-20 ל-30 ימים
+    # כך שתורן + דגל ייצגו לפחות 6 שבועות מסחר
+    # -------------------------------------------------------
     pole = np.linspace(0, 1.0, 10)
     flag_trend = np.linspace(1.0, 0.7, 20)
-    flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
+    flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05
     templates["🚩 דגל שורי"] = {
-        "data": np.concatenate((pole, flag_waves)), 
-        "windows": [20, 30, 45], "threshold": 0.12, "min_corr": 0.88, "comp": 0
+        "data": np.concatenate((pole, flag_waves)),
+        "windows": [30, 45, 60],          # תיקון: הסרנו 20, הוספנו 60
+        "threshold": 0.12, "min_corr": 0.88, "comp": 0
     }
 
     rise = np.linspace(0, 1.0, 10)
-    initial_pullback = np.linspace(1.0, 0.8, 5) 
+    initial_pullback = np.linspace(1.0, 0.8, 5)
     box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
     templates["📦 מלבן דרווס"] = {
-        "data": np.concatenate((rise, initial_pullback, box)), 
+        "data": np.concatenate((rise, initial_pullback, box)),
         "windows": [40, 60, 90], "threshold": 0.12, "min_corr": 0.85, "comp": 1
     }
 
-    l_drop = np.linspace(1.0, 0.1, 15)  
-    m_up = np.linspace(0.1, 0.6, 15)    
-    m_down = np.linspace(0.6, 0.0, 15)  
-    r_up = np.linspace(0.0, 1.0, 15)    
-    templates["🧲 תחתית כפולה"] = {
-        "data": np.concatenate((l_drop, m_up, m_down, r_up)), 
-        "windows": [50, 80, 120, 180], "threshold": 0.15, "min_corr": 0.82, "comp": 2
-    }
+    # -------------------------------------------------------
+    # תחתית כפולה הוסרה לפי בקשה — אין שינוי
+    # -------------------------------------------------------
 
     left_cup = np.linspace(-1, 0, 45)**2
     right_cup = np.linspace(0, 1, 20)**2
     handle_trend = np.linspace(1.0, 0.7, 15)
-    handle_waves = handle_trend + np.cos(np.linspace(0, 2*np.pi, 15)) * 0.03
+    # תיקון #4: sin() במקום cos() לאינטגרציה טבעית יותר של הידית
+    handle_waves = handle_trend + np.sin(np.linspace(0, 2*np.pi, 15)) * 0.03
     templates["☕ ספל וידית"] = {
-        "data": np.concatenate((left_cup, right_cup, handle_waves)), 
+        "data": np.concatenate((left_cup, right_cup, handle_waves)),
         "windows": [60, 90, 150, 250], "threshold": 0.15, "min_corr": 0.82, "comp": 2
     }
 
@@ -228,18 +226,17 @@ def check_all_dtw_patterns(closes):
         for window in config["windows"]:
             if len(closes) < window:
                 continue
-            
+
             current_closes = closes[-window:]
-            
+
             # --- מנעול מספר 1: תנועה אמיתית במחיר ---
-            # תבנית חייבת להכיל תנועה של לפחות 10% במחיר כדי לא להיסרק כ"רעש נמוך" שנופח
             raw_min = np.min(current_closes)
             raw_max = np.max(current_closes)
             if raw_min == 0 or (raw_max - raw_min) / raw_min < 0.10:
                 continue
-                
+
             norm_current = normalize_series(current_closes)
-            
+
             # מניעת תנודתיות רעשית מדי (שיני מסור)
             if np.std(norm_current) > 0.35:
                 continue
@@ -248,23 +245,21 @@ def check_all_dtw_patterns(closes):
             x_new = np.linspace(0, 1, window)
             resized_template = np.interp(x_new, x_orig, config["data"])
             norm_template_resized = normalize_series(resized_template)
-            
+
             corr = np.corrcoef(norm_current, norm_template_resized)[0, 1]
-            
-            # --- מנעול מספר 2: סף קורלציה דינמי (לדגלים הרף הרבה יותר קשה) ---
+
+            # --- מנעול מספר 2: סף קורלציה דינמי ---
             if pd.isna(corr) or corr < config["min_corr"]:
                 continue
-                
+
             # --- מנעול מספר 3: היגיון אנושי במחירי אמת ---
             w = window
             if "דגל" in name:
-                # תחילת התורן חייבת להיות נמוכה משמעותית מסוף הדגל
                 start_price = current_closes[0]
                 end_price = current_closes[-1]
                 if end_price <= start_price * 1.05: continue
-                
+
             elif "ספל" in name:
-                # קרקעית הידית אסור שתשבור את קרקעית הכוס
                 cup_bottom = np.min(current_closes[:int(w*0.8)])
                 handle_bottom = np.min(current_closes[-int(w*0.2):])
                 if handle_bottom < cup_bottom: continue
@@ -272,26 +267,22 @@ def check_all_dtw_patterns(closes):
             # חישוב DTW הסופי רק למי ששרד את המנעולים
             distance, path = fastdtw(norm_current, norm_template_resized, dist=lambda x, y: abs(x - y))
             avg_distance = distance / window
-            
+
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 best_score = avg_distance
-                
-                # חישוב פיבוטים הגיוני
+
                 if "דגל" in name:
                     pivot = float(np.max(current_closes[:int(w*0.5)]))
                     low = float(np.min(current_closes[-int(w*0.5):]))
                 elif "דרווס" in name:
                     pivot = float(np.max(current_closes[-int(w*0.7):]))
                     low = float(np.min(current_closes[-int(w*0.7):]))
-                elif "תחתית" in name:
-                    pivot = float(np.max(current_closes[int(w*0.3):int(w*0.7)]))
-                    low = float(np.min(current_closes[-int(w*0.4):]))
-                else: 
+                else:  # ספל וידית
                     pivot = float(np.max(current_closes[int(w*0.6):int(w*0.9)]))
                     low = float(np.min(current_closes[-int(w*0.3):]))
-                
+
                 tightness = (pivot - low) / pivot if pivot > 0 else 0
-                
+
                 best_pattern = {
                     "type": f"{name} (DTW)",
                     "dtw_distance": round(avg_distance, 3),
@@ -303,11 +294,11 @@ def check_all_dtw_patterns(closes):
                     "last_pullback_low": low,
                     "tightness": tightness,
                     "base_depth": 0.20,
-                    "dry_up_ratio": 1.0, 
+                    "dry_up_ratio": 1.0,
                     "touches": 2,
                     "base_length": window
                 }
-                
+
     return best_pattern
 
 # ==========================================
@@ -315,19 +306,29 @@ def check_all_dtw_patterns(closes):
 # ==========================================
 def calc_setup_score(alert):
     rs_score = min(max(alert["rs_65"], 0) * 250, 25)
-    tight_score = max(0, (1 - min(alert["tightness"], 0.10) / 0.10) * 20)
-    pivot_score = max(0, (1 - min(abs(alert["dist_to_pivot"]), 0.03) / 0.03) * 15)
+
+    # תיקון #2: סף tightness גמיש לפי סוג תבנית
+    # דגל — דחיסות טבעית <10%, ספל/דרווס — עד 22%
+    tight_ceiling = 0.10 if "דגל" in alert["type"] else 0.22
+    tight_score = max(0, (1 - min(alert["tightness"], tight_ceiling) / tight_ceiling) * 20)
+
+    # תיקון #6: עונש על כניסה מאוחרת מעבר לפיבוט
+    if alert["dist_to_pivot"] > BRAIN["max_gap_above_pivot"]:
+        pivot_score = -10
+    else:
+        pivot_score = max(0, (1 - min(abs(alert["dist_to_pivot"]), 0.03) / 0.03) * 15)
+
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
-    
+
     dtw_score = max(0, (alert["threshold"] - alert["dtw_distance"]) * 100)
-    corr_score = max(0, (alert["correlation"] - 80)) * 1.5 
-    
-    # בונוס כפול לתבניות מורכבות (כדי לשבור את המונופול של הדגלים)
-    comp_bonus = alert.get("complexity_bonus", 0) * 15 
-    
+    corr_score = max(0, (alert["correlation"] - 80)) * 1.5
+
+    # בונוס כפול לתבניות מורכבות
+    comp_bonus = alert.get("complexity_bonus", 0) * 15
+
     bonus = 5 if not alert["is_below_150"] else 0
-    
+
     return round(rs_score + tight_score + pivot_score + close_score + volume_score + dtw_score + corr_score + comp_bonus + bonus, 1)
 
 def scan_market():
@@ -369,7 +370,7 @@ def scan_market():
 
             past_filtered = past_data.dropna(subset=['Close'])
             if len(past_filtered) < 30: continue
-            
+
             closes = past_filtered["Close"].astype(float).values
 
             pattern = check_all_dtw_patterns(closes)
@@ -380,8 +381,9 @@ def scan_market():
             pivot = float(pattern["pivot_price"])
             dist_to_pivot = (close / pivot) - 1.0
 
-            if dist_to_pivot < -0.15 or dist_to_pivot > 0.05: continue
-            stats["pass_pivot_dist"] += 1 
+            # תיקון #5: חלון סינון מצומצם — ספסל עמוק מ-10% לא עובר
+            if dist_to_pivot < -0.10 or dist_to_pivot > 0.05: continue
+            stats["pass_pivot_dist"] += 1
 
             vol_ratio = float(today["Volume"]) / float(today["Vol_50"]) if float(today["Vol_50"]) > 0 else 0.0
             close_strength = (close - float(today["Low"])) / max(float(today["High"]) - float(today["Low"]), 1e-9)
@@ -419,15 +421,15 @@ def scan_market():
                 "threshold": float(pattern["threshold"]),
                 "complexity_bonus": int(pattern.get("complexity_bonus", 0))
             }
-                
+
             alert_data["setup_score"] = calc_setup_score(alert_data)
-            
-            # מנעול סופי: סינון כל מה שקיבל ציון עלוב מתחת ל-45
+
+            # מנעול סופי: סינון ציון עלוב מתחת ל-45
             if alert_data["setup_score"] >= 45.0:
                 all_potentials.append(alert_data)
                 stats["final_approved"] += 1
 
-        except Exception as e: 
+        except Exception as e:
             pass
 
     print("\n--- 📊 דוח סינון קורלציה נוקשה ו-DTW 📊 ---")
@@ -478,7 +480,14 @@ def scan_market():
             msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f} | 📅 <b>טווח:</b> {a['base_length']} ימים\n"
             msg += f"🔗 <a href='https://il.tradingview.com/chart/?symbol={a['ticker']}'>TradingView</a>\n\n"
 
-            save_to_smart_memory(a["ticker"], a["close"], a["stop_loss"], a["risk_pct"], a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"], a["tightness"], a["type"], a["status"], a["setup_score"], a["dry_up_ratio"], a["touches"])
+            # תיקון #1: שמירה לזיכרון רק עבור מניות עם סטופ תקין (לא ספסל)
+            if a["status"] != "🪑 ספסל":
+                save_to_smart_memory(
+                    a["ticker"], a["close"], a["stop_loss"], a["risk_pct"],
+                    a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"],
+                    a["tightness"], a["type"], a["status"], a["setup_score"],
+                    a["dry_up_ratio"], a["touches"]
+                )
 
     send_telegram(msg)
 
