@@ -167,7 +167,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות מבוסס ראייה (Deep Time Vision)
+# 4. מנוע זיהוי תבניות מבוסס ראייה
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -180,14 +180,14 @@ def normalize_series(series):
 def get_dtw_templates():
     templates = {}
     
-    strict_threshold = 0.12 # סף קפדני לכולם
+    strict_threshold = 0.12 
 
     pole = np.linspace(0, 1.0, 10)
     flag_trend = np.linspace(1.0, 0.7, 20)
     flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
     templates["🚩 דגל שורי"] = {
         "data": np.concatenate((pole, flag_waves)), 
-        "windows": list(range(15, 66, 5)), # חלונות דינמיים!
+        "windows": list(range(15, 66, 5)), 
         "threshold": strict_threshold, "min_corr": 0.88, "comp": 0
     }
 
@@ -234,7 +234,6 @@ def check_all_dtw_patterns(closes):
             
             current_closes = closes[-window:]
             
-            # --- מנעול מספר 1: תנועה אמיתית במחיר (מינימום 10% רוחב) ---
             raw_min = np.min(current_closes)
             raw_max = np.max(current_closes)
             if raw_min == 0 or (raw_max - raw_min) / raw_min < 0.10:
@@ -242,7 +241,6 @@ def check_all_dtw_patterns(closes):
                 
             norm_current = normalize_series(current_closes)
             
-            # מניעת תנודתיות רעשית מדי (שיני מסור)
             if np.std(norm_current) > 0.35:
                 continue
 
@@ -253,11 +251,9 @@ def check_all_dtw_patterns(closes):
             
             corr = np.corrcoef(norm_current, norm_template_resized)[0, 1]
             
-            # --- מנעול מספר 2: קורלציה אנושית מינימלית ---
             if pd.isna(corr) or corr < config["min_corr"]:
                 continue
                 
-            # --- מנעול מספר 3: היגיון אנושי במחירי אמת ---
             w = window
             if "דגל" in name:
                 start_price = current_closes[0]
@@ -276,28 +272,20 @@ def check_all_dtw_patterns(closes):
             if ("ספל" in name or "תחתית" in name) and current_closes[-1] <= np.min(current_closes) * 1.05:
                 continue 
 
-            # חישוב DTW סופי למי ששרד את המנעולים
             distance, path = fastdtw(norm_current, norm_template_resized, dist=lambda x, y: abs(x - y))
             avg_distance = distance / window
             
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 best_score = avg_distance
                 
-                # מציאת הפיבוט בצורה יחסית
                 if "דגל" in name:
                     pivot = float(np.max(current_closes[:int(w*0.5)]))
-                    low = float(np.min(current_closes[-int(w*0.5):]))
                 elif "דרווס" in name:
                     pivot = float(np.max(current_closes[-int(w*0.7):]))
-                    low = float(np.min(current_closes[-int(w*0.7):]))
                 elif "תחתית" in name:
                     pivot = float(np.max(current_closes[int(w*0.3):int(w*0.7)]))
-                    low = float(np.min(current_closes[-int(w*0.4):]))
                 else: 
                     pivot = float(np.max(current_closes[int(w*0.6):int(w*0.9)]))
-                    low = float(np.min(current_closes[-int(w*0.3):]))
-                
-                tightness = (pivot - low) / pivot if pivot > 0 else 0
                 
                 best_pattern = {
                     "type": f"{name} (DTW)",
@@ -306,12 +294,6 @@ def check_all_dtw_patterns(closes):
                     "complexity_bonus": config["comp"],
                     "threshold": config["threshold"],
                     "pivot_price": pivot,
-                    "tight_low": low,
-                    "last_pullback_low": low,
-                    "tightness": tightness,
-                    "base_depth": 0.20,
-                    "dry_up_ratio": 1.0, 
-                    "touches": 2,
                     "base_length": window
                 }
                 
@@ -322,7 +304,6 @@ def check_all_dtw_patterns(closes):
 # ==========================================
 def calc_setup_score(alert):
     rs_score = min(max(alert["rs_65"], 0) * 250, 25)
-    tight_score = max(0, (1 - min(alert["tightness"], 0.10) / 0.10) * 20)
     pivot_score = max(0, (1 - min(abs(alert["dist_to_pivot"]), 0.03) / 0.03) * 15)
     close_score = min(max(alert["close_strength"], 0), 1) * 10
     volume_score = min(alert["vol_ratio"] / 2.0, 1.0) * 5
@@ -333,7 +314,7 @@ def calc_setup_score(alert):
     comp_bonus = alert.get("complexity_bonus", 0) * 15 
     bonus = 5 if not alert["is_below_150"] else 0
     
-    return round(rs_score + tight_score + pivot_score + close_score + volume_score + dtw_score + corr_score + comp_bonus + bonus, 1)
+    return round(rs_score + pivot_score + close_score + volume_score + dtw_score + corr_score + comp_bonus + bonus, 1)
 
 def scan_market():
     tickers = load_tickers()
@@ -401,8 +382,23 @@ def scan_market():
             else:
                 status = "🪑 ספסל"
 
-            stop_price = min(float(pattern["tight_low"]), float(pattern["last_pullback_low"])) - (0.5 * float(today["ATR_14"]))
-            risk_pct = (close - stop_price) / close * 100
+            # -------------------------------------------------------------
+            # בניית תוכנית המסחר: כניסה אופטימלית וסטופ לוס אסטרטגי מתחת לפיבוט
+            # -------------------------------------------------------------
+            
+            # כניסה אופטימלית: קצת מעל הפיבוט כדי לאשר שהפריצה קרתה באמת ולא נבלמה על הקו
+            optimal_entry = pivot * 1.002
+            
+            # סטופ לוס: ממש מתחת לקו הפריצה (בתוספת קטנה של תנודתיות ATR כדי לא לעוף מניעור קל)
+            # סטופ של 0.8 * ATR נותן מרווח נשימה הגיוני מתחת להתנגדות שהפכה לתמיכה
+            atr = float(today["ATR_14"])
+            stop_price = pivot - (0.8 * atr)
+            
+            # הגנה למקרה שה-ATR מטורף: מוודאים שהסטופ הוא לא יותר מ-8% מהכניסה האופטימלית
+            if (optimal_entry - stop_price) / optimal_entry > 0.08:
+                stop_price = optimal_entry * 0.92
+                
+            risk_pct = (optimal_entry - stop_price) / optimal_entry * 100
 
             if status != "🪑 ספסל":
                 if stop_price >= close or risk_pct > 12.0: status = "🪑 ספסל"
@@ -413,11 +409,10 @@ def scan_market():
 
             alert_data = {
                 "ticker": ticker, "close": close, "pivot": pivot, "stop_loss": stop_price,
+                "optimal_entry": optimal_entry, # נוסף כניסה אופטימלית
                 "risk_pct": risk_pct, "vol_ratio": vol_ratio, "type": pattern["type"],
                 "rs_65": stock_rs, "close_strength": close_strength, "status": status,
-                "dist_to_pivot": dist_to_pivot, "tightness": float(pattern["tightness"]),
-                "is_below_150": is_below_150, "dry_up_ratio": float(pattern["dry_up_ratio"]),
-                "touches": int(pattern["touches"]), "base_depth": float(pattern["base_depth"]),
+                "dist_to_pivot": dist_to_pivot, "is_below_150": is_below_150,
                 "base_length": int(pattern["base_length"]),
                 "dtw_distance": float(pattern["dtw_distance"]),
                 "correlation": float(pattern["correlation"]),
@@ -427,7 +422,6 @@ def scan_market():
                 
             alert_data["setup_score"] = calc_setup_score(alert_data)
             
-            # סינון סופי: רק מניות עם ציון גבוה מ-45
             if alert_data["setup_score"] >= 45.0:
                 all_potentials.append(alert_data)
                 stats["final_approved"] += 1
@@ -440,22 +434,12 @@ def scan_market():
         print(f"{key}: {val}")
     print("-------------------------------------------\n")
 
-    if all_potentials:
-        print("--- 📋 רשימת המניות שעברו את הסינון הקיצוני 📋 ---")
-        sorted_all = sorted(all_potentials, key=lambda x: -x["setup_score"])
-        for idx, s in enumerate(sorted_all, 1):
-            clean_type = s['type'].replace(' (DTW)', '')
-            print(f"{idx}. {s['ticker']:<5} | תבנית: {clean_type:<15} | ציון: {s['setup_score']:<4.1f} | טווח: {s['base_length']} ימ | קורלציה: {s['correlation']}% | פיבוט: ${s['pivot']:.2f}")
-        print("--------------------------------------------------\n")
-    else:
-        print("לא נמצאו מניות העונות לקריטריונים.")
-
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
 
     final_selection = (prime + bench)[:TOP_RESULTS]
     if not final_selection:
-        send_telegram("✅ הסריקה הסתיימה. הבוט קפדני במיוחד (רמת צלף), לא נמצאו תבניות מדויקות היום.")
+        send_telegram("✅ הסריקה הסתיימה. לא נמצאו תבניות שמרניות מספיק היום.")
         return
 
     msg = "🎯 <b>סריקת ראייה ממוחשבת מרובת זמנים (DTW)!</b>\n"
@@ -477,13 +461,21 @@ def scan_market():
             status_icon = "🔥" if "פריצה" in a["status"] else "⏳" if "מתבשלת" in a["status"] else "🪑"
             clean_status = a['status'].replace(' (Watchlist)', '')
 
-            msg += f"{status_icon} <b>{a['ticker']}</b> | סטטוס: {clean_status}\n"
-            msg += f"⭐ <b>ציון מלא:</b> {a['setup_score']:.1f} | 📏 <b>דמיון:</b> {a['correlation']}%\n"
-            msg += f"🎯 <b>פיבוט:</b> ${a['pivot']:.2f} | 💵 <b>מחיר:</b> ${a['close']:.2f}\n"
-            msg += f"🛡️ <b>סטופ:</b> ${a['stop_loss']:.2f} | 📅 <b>טווח:</b> {a['base_length']} ימים\n"
+            msg += f"{status_icon} <b>{a['ticker']}</b> | ציון: {a['setup_score']:.1f}\n"
+            
+            # --- הודעת התכנון החדשה והמפורטת ---
+            msg += f"📖 <b>תוכנית מסחר:</b> התבנית נבנתה במשך {a['base_length']} ימים (דמיון של {a['correlation']}% לצורה האידיאלית). "
+            if "פריצה" in a["status"]:
+                msg += f"המניה פרצה את הפיבוט וכעת נסחרת ב-${a['close']:.2f}. "
+            else:
+                msg += f"המניה עדיין בונה את הכתף הימנית/הידית, מומלץ להציב התראת מחיר. "
+            
+            msg += f"\n🟢 <b>כניסה אופטימלית:</b> חצייה של ${a['optimal_entry']:.2f}\n"
+            msg += f"🔴 <b>סטופ-לוס אסטרטגי:</b> ${a['stop_loss']:.2f} (ממוקם מתחת לקו הפריצה, סיכון מחושב של {a['risk_pct']:.1f}%)\n"
+            
             msg += f"🔗 <a href='https://il.tradingview.com/chart/?symbol={a['ticker']}'>TradingView</a>\n\n"
 
-            save_to_smart_memory(a["ticker"], a["close"], a["stop_loss"], a["risk_pct"], a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"], a["tightness"], a["type"], a["status"], a["setup_score"], a["dry_up_ratio"], a["touches"])
+            save_to_smart_memory(a["ticker"], a["close"], a["stop_loss"], a["risk_pct"], a["vol_ratio"], a["pivot"], a["close_strength"], a["rs_65"], 0.05, a["type"], a["status"], a["setup_score"], 1.0, 2)
 
     send_telegram(msg)
 
