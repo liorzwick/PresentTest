@@ -70,7 +70,7 @@ def send_telegram(message):
     print("שולח הודעה לטלגרם...")
     print("="*25 + "\n")
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ פרטי טלגרם חסרים, מדלג על שליחה.")
+        print("⚠️ פרטי טלגרם חסרים. הפלט מוצג רק בלוגים של המערכת (למעלה).")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -235,14 +235,11 @@ def check_all_dtw_patterns(closes, highs, lows):
             current_highs = highs[-window:]
             current_lows = lows[-window:]
             
-            # --- מנעול מספר 1: תנועה אמיתית במחיר ---
-            # משתמשים בנמוך האמיתי ובגבוה האמיתי לבדוק אם הייתה תנועה של לפחות 10%
             raw_min = np.min(current_lows)
             raw_max = np.max(current_highs)
             if raw_min == 0 or (raw_max - raw_min) / raw_min < 0.10:
                 continue
                 
-            # את התאמת הצורה נמשיך לעשות לפי שערי סגירה כדי להימנע מרעש ויזואלי של זנבות
             norm_current = normalize_series(current_closes)
             if np.std(norm_current) > 0.35:
                 continue
@@ -278,10 +275,6 @@ def check_all_dtw_patterns(closes, highs, lows):
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 best_score = avg_distance
                 
-                # --- החילוץ הקריטי של המחירים האמיתיים ---
-                # כעת הפיבוטים מחושבים מתוך מערך ה-High (הזנבות העליונים)! 
-                # והתחתיות מתוך מערך ה-Low.
-                
                 if "דגל" in name:
                     pivot = float(np.max(current_highs[:int(w*0.5)]))
                     low = float(np.min(current_lows[-int(w*0.5):]))
@@ -291,8 +284,8 @@ def check_all_dtw_patterns(closes, highs, lows):
                 elif "תחתית" in name:
                     pivot = float(np.max(current_highs[int(w*0.3):int(w*0.7)]))
                     low = float(np.min(current_lows[-int(w*0.4):]))
-                else: # ספל
-                    pivot = float(np.max(current_highs[int(w*0.6):int(w*0.9)]))
+                else: 
+                    pivot = float(np.max(current_highs[:int(w*0.3)]))
                     low = float(np.min(current_lows[-int(w*0.3):]))
                 
                 tightness = (pivot - low) / pivot if pivot > 0 else 0
@@ -372,7 +365,6 @@ def scan_market():
             past_filtered = past_data.dropna(subset=['Close'])
             if len(past_filtered) < 30: continue
             
-            # אנו מעבירים למנוע גם שערי סגירה, גם גבוהים וגם נמוכים!
             closes = past_filtered["Close"].astype(float).values
             highs = past_filtered["High"].astype(float).values
             lows = past_filtered["Low"].astype(float).values
@@ -395,19 +387,16 @@ def scan_market():
             is_near_breakout = (-BRAIN["watchlist_max_dist"] <= dist_to_pivot <= 0.0)
 
             if is_breakout:
-                status = "🔥 פריצה פעילה!" if close_strength >= 0.55 and vol_ratio >= 1.3 else "🪑 ספסל"
+                if dist_to_pivot > BRAIN["max_entry_extension"]:
+                    status = "🪑 ספסל"
+                else:
+                    status = "🔥 פריצה פעילה!" if close_strength >= 0.55 and vol_ratio >= 1.3 else "🪑 ספסל"
             elif is_near_breakout:
                 status = "👀 מתבשלת (Watchlist)"
             else:
                 status = "🪑 ספסל"
 
-            # -------------------------------------------------------------
-            # חישובי מסחר אסטרטגיים
-            # -------------------------------------------------------------
-            # כניסה אופטימלית: קצת מעל הפיבוט האמיתי
             optimal_entry = pivot * 1.002
-            
-            # סטופ לוס מתחת לפיבוט מוגן על ידי תנודתיות (ATR)
             atr = float(today["ATR_14"])
             stop_price = pivot - (0.8 * atr)
             
@@ -445,19 +434,33 @@ def scan_market():
         except Exception as e: 
             pass
 
-    print("\n--- 📊 דוח סינון קורלציה נוקשה ו-DTW 📊 ---")
+    print("\n--- 📊 דוח סריקה כללי 📊 ---")
     for key, val in stats.items():
         print(f"{key}: {val}")
-    print("-------------------------------------------\n")
+    print("-----------------------------\n")
 
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
 
     final_selection = (prime + bench)[:TOP_RESULTS]
-    if not final_selection:
-        send_telegram("✅ הסריקה הסתיימה. לא נמצאו תבניות שמרניות מספיק היום.")
+    
+    # -------------------------------------------------------------
+    # הדפסה ויזואלית ומסודרת ללוגים (במיוחד אם טלגרם נופל)
+    # -------------------------------------------------------------
+    if final_selection:
+        print("=== 🏆 התוצאות הסופיות (נשלחות לטלגרם) 🏆 ===")
+        for idx, a in enumerate(final_selection, 1):
+            clean_type = a['type'].replace(' (DTW)', '')
+            clean_status = a['status'].replace(' (Watchlist)', '')
+            print(f"{idx}. {a['ticker']:<5} | סטטוס: {clean_status:<15} | תבנית: {clean_type:<15} | ציון: {a['setup_score']:<4.1f} | כניסה: ${a['optimal_entry']:.2f} | סטופ: ${a['stop_loss']:.2f} | דמיון: {a['correlation']}%")
+        print("=================================================\n")
+    else:
+        print("✅ הסריקה הסתיימה. לא נמצאו תבניות שמרניות מספיק היום, ולכן שום דבר לא יודפס או ישלח.\n")
         return
 
+    # -------------------------------------------------------------
+    # יצירת ההודעה ושליחה לטלגרם
+    # -------------------------------------------------------------
     msg = "🎯 <b>סריקת ראייה ממוחשבת מרובת זמנים (DTW)!</b>\n"
     msg += f"<i>(מציג עד {TOP_RESULTS} מניות שזוהו באמצעות התאמת צורה)</i>\n\n"
 
