@@ -442,17 +442,25 @@ def scan_market():
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
 
-    final_selection = (prime + bench)[:TOP_RESULTS]
+    # יצירת רשימה מאוחדת וממוינת של כל מה שעבר את הסינון
+    all_sorted_results = prime + bench
+    
+    # חיתוך לטובת הטלגרם
+    final_selection = all_sorted_results[:TOP_RESULTS]
     
     # -------------------------------------------------------------
-    # הדפסה ויזואלית ומסודרת ללוגים (במיוחד אם טלגרם נופל)
+    # הדפסה ויזואלית ומסודרת ללוגים (מדפיס את כ-ל מה שנמצא!)
     # -------------------------------------------------------------
-    if final_selection:
-        print("=== 🏆 התוצאות הסופיות (נשלחות לטלגרם) 🏆 ===")
-        for idx, a in enumerate(final_selection, 1):
+    if all_sorted_results:
+        print(f"=== 🏆 כל המניות שעברו את הסינון ({len(all_sorted_results)} מניות) 🏆 ===")
+        for idx, a in enumerate(all_sorted_results, 1):
             clean_type = a['type'].replace(' (DTW)', '')
             clean_status = a['status'].replace(' (Watchlist)', '')
-            print(f"{idx}. {a['ticker']:<5} | סטטוס: {clean_status:<15} | תבנית: {clean_type:<15} | ציון: {a['setup_score']:<4.1f} | כניסה: ${a['optimal_entry']:.2f} | סטופ: ${a['stop_loss']:.2f} | דמיון: {a['correlation']}%")
+            
+            # תיוג ויזואלי כדי להבדיל בין מי שנשלח לטלגרם למי שנשאר רק בגיטהאב
+            is_sent = "📩 נשלח" if idx <= TOP_RESULTS else "🗄️ נשאר בלוג"
+            
+            print(f"{idx}. [{is_sent}] {a['ticker']:<5} | סטטוס: {clean_status:<15} | תבנית: {clean_type:<15} | ציון: {a['setup_score']:<4.1f} | כניסה: ${a['optimal_entry']:.2f} | סטופ: ${a['stop_loss']:.2f} | דמיון: {a['correlation']}%")
         print("=================================================\n")
     else:
         print("✅ הסריקה הסתיימה. לא נמצאו תבניות שמרניות מספיק היום, ולכן שום דבר לא יודפס או ישלח.\n")
