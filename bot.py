@@ -167,7 +167,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות (מופרד לחישובי צורה מול מחיר אמיתי)
+# 4. מנוע זיהוי תבניות (ממוקד בסיסים גדולים בלבד)
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -179,26 +179,9 @@ def normalize_series(series):
 
 def get_dtw_templates():
     templates = {}
-    strict_threshold = 0.12 
-
-    pole = np.linspace(0, 1.0, 10)
-    flag_trend = np.linspace(1.0, 0.7, 20)
-    flag_waves = flag_trend + np.sin(np.linspace(0, 4*np.pi, 20)) * 0.05 
-    templates["🚩 דגל שורי"] = {
-        "data": np.concatenate((pole, flag_waves)), 
-        "windows": list(range(15, 66, 5)), 
-        "threshold": strict_threshold, "min_corr": 0.88, "comp": 0
-    }
-
-    rise = np.linspace(0, 1.0, 10)
-    initial_pullback = np.linspace(1.0, 0.8, 5) 
-    box = np.ones(35) * 0.9 + np.sin(np.linspace(0, 6*np.pi, 35)) * 0.05
-    templates["📦 מלבן דרווס"] = {
-        "data": np.concatenate((rise, initial_pullback, box)), 
-        "windows": list(range(25, 151, 10)), 
-        "threshold": strict_threshold, "min_corr": 0.85, "comp": 1
-    }
-
+    
+    # הסרנו לחלוטין את "דגל שורי" ואת "מלבן דרווס"
+    
     l_drop = np.linspace(1.0, 0.1, 15)  
     m_up = np.linspace(0.1, 0.6, 15)    
     m_down = np.linspace(0.6, 0.0, 15)  
@@ -254,19 +237,14 @@ def check_all_dtw_patterns(closes, highs, lows):
                 continue
                 
             w = window
-            if "דגל" in name:
-                start_price = current_closes[0]
-                end_price = current_closes[-1]
-                if end_price <= start_price * 1.05: continue
-            elif "ספל" in name:
+            
+            # בדיקות הגיון ייעודיות רק לספל ותחתית
+            if "ספל" in name:
                 cup_bottom = np.min(current_closes[:int(w*0.8)])
                 handle_bottom = np.min(current_closes[-int(w*0.2):])
                 if handle_bottom < cup_bottom: continue
-            elif "דרווס" in name:
-                if (np.max(current_closes[-15:]) - np.min(current_closes[-15:])) / np.max(current_closes[-15:]) > 0.15:
-                    continue
                     
-            if ("ספל" in name or "תחתית" in name) and current_closes[-1] <= np.min(current_closes) * 1.05:
+            if current_closes[-1] <= np.min(current_closes) * 1.05:
                 continue 
 
             distance, path = fastdtw(norm_current, norm_template_resized, dist=lambda x, y: abs(x - y))
@@ -275,16 +253,12 @@ def check_all_dtw_patterns(closes, highs, lows):
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 best_score = avg_distance
                 
-                if "דגל" in name:
-                    pivot = float(np.max(current_highs[:int(w*0.5)]))
-                    low = float(np.min(current_lows[-int(w*0.5):]))
-                elif "דרווס" in name:
-                    pivot = float(np.max(current_highs[-int(w*0.7):]))
-                    low = float(np.min(current_lows[-int(w*0.7):]))
-                elif "תחתית" in name:
+                # חישוב פיבוטים מותאם רק לבסיסים הגדולים
+                if "תחתית" in name:
                     pivot = float(np.max(current_highs[int(w*0.3):int(w*0.7)]))
                     low = float(np.min(current_lows[-int(w*0.4):]))
                 else: 
+                    # ספל וידית
                     pivot = float(np.max(current_highs[:int(w*0.3)]))
                     low = float(np.min(current_lows[-int(w*0.3):]))
                 
@@ -442,22 +416,14 @@ def scan_market():
     prime = sorted([s for s in all_potentials if s["status"] != "🪑 ספסל"], key=lambda x: -x["setup_score"])
     bench = sorted([s for s in all_potentials if s["status"] == "🪑 ספסל"], key=lambda x: abs(x["dist_to_pivot"]))
 
-    # יצירת רשימה מאוחדת וממוינת של כל מה שעבר את הסינון
     all_sorted_results = prime + bench
-    
-    # חיתוך לטובת הטלגרם
     final_selection = all_sorted_results[:TOP_RESULTS]
     
-    # -------------------------------------------------------------
-    # הדפסה ויזואלית ומסודרת ללוגים (מדפיס את כ-ל מה שנמצא!)
-    # -------------------------------------------------------------
     if all_sorted_results:
         print(f"=== 🏆 כל המניות שעברו את הסינון ({len(all_sorted_results)} מניות) 🏆 ===")
         for idx, a in enumerate(all_sorted_results, 1):
             clean_type = a['type'].replace(' (DTW)', '')
             clean_status = a['status'].replace(' (Watchlist)', '')
-            
-            # תיוג ויזואלי כדי להבדיל בין מי שנשלח לטלגרם למי שנשאר רק בגיטהאב
             is_sent = "📩 נשלח" if idx <= TOP_RESULTS else "🗄️ נשאר בלוג"
             
             print(f"{idx}. [{is_sent}] {a['ticker']:<5} | סטטוס: {clean_status:<15} | תבנית: {clean_type:<15} | ציון: {a['setup_score']:<4.1f} | כניסה: ${a['optimal_entry']:.2f} | סטופ: ${a['stop_loss']:.2f} | דמיון: {a['correlation']}%")
@@ -466,10 +432,7 @@ def scan_market():
         print("✅ הסריקה הסתיימה. לא נמצאו תבניות שמרניות מספיק היום, ולכן שום דבר לא יודפס או ישלח.\n")
         return
 
-    # -------------------------------------------------------------
-    # יצירת ההודעה ושליחה לטלגרם
-    # -------------------------------------------------------------
-    msg = "🎯 <b>סריקת ראייה ממוחשבת מרובת זמנים (DTW)!</b>\n"
+    msg = "🎯 <b>סריקת ראייה ממוחשבת - בסיסים גדולים!</b>\n"
     msg += f"<i>(מציג עד {TOP_RESULTS} מניות שזוהו באמצעות התאמת צורה)</i>\n\n"
 
     pattern_groups = {}
