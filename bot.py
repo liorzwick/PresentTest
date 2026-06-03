@@ -29,9 +29,6 @@ SCAN_PERIOD = "2y"
 def load_brain():
     brain = {
         "min_breakout_close_strength": 0.55,
-        "min_rs_65": 0.03,
-        "max_dist_from_52w_high_normal": 0.45,   
-        "max_dist_from_52w_high_below_150": 0.50, 
         "max_gap_above_pivot": 0.02,
         "max_entry_extension": 0.04,          
         "breakout_volume_ratio": 1.3,         
@@ -150,7 +147,6 @@ def add_indicators(df):
     df["DollarVol_50"] = df["Close"].rolling(50, min_periods=25).mean() * df["Vol_50"]
     df["Prev_Close"] = df["Close"].shift(1)
     df["ROC_65"] = df["Close"].pct_change(65)
-    df["High_252"] = df["High"].rolling(252, min_periods=120).max()
     tr = pd.concat([df["High"] - df["Low"], (df["High"] - df["Prev_Close"]).abs(), (df["Low"] - df["Prev_Close"]).abs()], axis=1).max(axis=1)
     df["ATR_14"] = tr.rolling(14, min_periods=7).mean()
     df["ATR_Pct"] = df["ATR_14"] / df["Close"] 
@@ -167,7 +163,7 @@ def get_spy_data():
     return pd.DataFrame()
 
 # ==========================================
-# 4. מנוע זיהוי תבניות (ממוקד בסיסים גדולים בלבד)
+# 4. מנוע זיהוי תבניות (בסיסים גדולים בלבד)
 # ==========================================
 def normalize_series(series):
     series_array = np.array(series)
@@ -179,8 +175,6 @@ def normalize_series(series):
 
 def get_dtw_templates():
     templates = {}
-    
-    # הסרנו לחלוטין את "דגל שורי" ואת "מלבן דרווס"
     
     l_drop = np.linspace(1.0, 0.1, 15)  
     m_up = np.linspace(0.1, 0.6, 15)    
@@ -238,7 +232,6 @@ def check_all_dtw_patterns(closes, highs, lows):
                 
             w = window
             
-            # בדיקות הגיון ייעודיות רק לספל ותחתית
             if "ספל" in name:
                 cup_bottom = np.min(current_closes[:int(w*0.8)])
                 handle_bottom = np.min(current_closes[-int(w*0.2):])
@@ -253,12 +246,10 @@ def check_all_dtw_patterns(closes, highs, lows):
             if avg_distance < config["threshold"] and avg_distance < best_score:
                 best_score = avg_distance
                 
-                # חישוב פיבוטים מותאם רק לבסיסים הגדולים
                 if "תחתית" in name:
                     pivot = float(np.max(current_highs[int(w*0.3):int(w*0.7)]))
                     low = float(np.min(current_lows[-int(w*0.4):]))
                 else: 
-                    # ספל וידית
                     pivot = float(np.max(current_highs[:int(w*0.3)]))
                     low = float(np.min(current_lows[-int(w*0.3):]))
                 
@@ -286,6 +277,7 @@ def check_all_dtw_patterns(closes, highs, lows):
 # 5. דירוג וסריקה
 # ==========================================
 def calc_setup_score(alert):
+    # חישוב הציון עדיין לוקח בחשבון עוצמה יחסית חיובית (יתרון למניות חזקות), אבל מינוס לא פוסל.
     rs_score = min(max(alert["rs_65"], 0) * 250, 25)
     pivot_score = max(0, (1 - min(abs(alert["dist_to_pivot"]), 0.03) / 0.03) * 15)
     close_score = min(max(alert["close_strength"], 0), 1) * 10
@@ -329,12 +321,12 @@ def scan_market():
 
             stats["pass_basic"] += 1
 
+            # ---------------------------------------------------------
+            # שינוי קריטי: הסרנו את חסימות ה-52W High ואת ה-RS השלילי!
+            # הבוט יבדוק כעת כל מניה שיש לה מחזור סביר ומחיר סביר.
+            # ---------------------------------------------------------
             is_below_150 = close < float(today["SMA_150"])
-            max_dist = BRAIN["max_dist_from_52w_high_below_150"] if is_below_150 else BRAIN["max_dist_from_52w_high_normal"]
-            if (close / float(today["High_252"])) - 1.0 < -max_dist: continue
-
             stock_rs = float(today["ROC_65"]) - float(spy_rs)
-            if stock_rs < BRAIN["min_rs_65"]: continue
 
             past_filtered = past_data.dropna(subset=['Close'])
             if len(past_filtered) < 30: continue
@@ -432,7 +424,7 @@ def scan_market():
         print("✅ הסריקה הסתיימה. לא נמצאו תבניות שמרניות מספיק היום, ולכן שום דבר לא יודפס או ישלח.\n")
         return
 
-    msg = "🎯 <b>סריקת ראייה ממוחשבת - בסיסים גדולים!</b>\n"
+    msg = "🎯 <b>סריקת ראייה ממוחשבת - בסיסים ושינויי מגמה!</b>\n"
     msg += f"<i>(מציג עד {TOP_RESULTS} מניות שזוהו באמצעות התאמת צורה)</i>\n\n"
 
     pattern_groups = {}
